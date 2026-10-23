@@ -1,0 +1,23 @@
+Here's the basic idea for a comics creator:
+
+We want a user interface where people can define the assets, the characters, and the location.
+
+The characters will have a set of fields describing their appearance, personality, motivation, and some background, with relevant formats for each.
+
+Every object has a defined JSON format that can be used for saving and communicating with an external large language model.
+
+There will be an initiation phase where the user can paste in or upload the manuscript or the input text. Then there will be a button that wraps this context together with system instructions and a bespoke instruction. This will also document the required JSON format.
+
+By pasting this combined prompt with context to an LLM, it will come back with a draft of the comic. It will suggest:
+• How the story is broken into scenes
+• How many panels will be used
+• How many panels will be on each page
+• The relative sizing and dimension of each panel
+
+All of this will be documented in the correct JSON format and then rendered in the app.
+
+The user can select elements: a whole page, specific panels, or dialogue within panels. By clicking a button and providing bespoke instructions, a prompt is generated in the clipboard. 
+
+The user can then give that to an LLM, which generates a modified version in the correct JSON format, affecting only the chosen elements. The user imports this back into the app to get an updated version. 
+
+The app will also include instruction prompts to generate images containing one or more pages of the comic.
