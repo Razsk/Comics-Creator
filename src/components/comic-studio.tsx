@@ -3,14 +3,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Character,
-  CharacterRole,
   Comic,
   ComicStorageAdapter,
   DialogueBalloonStyle,
   ImagePromptDeliveryMode,
   LetteringMode,
   Location,
-  LocationType,
   PanelFraming,
   PanelHeightWeight,
   PanelTextElement,
@@ -18,8 +16,16 @@ import {
   SelectionTarget,
   StagedDiff,
 } from '@/domain/types';
-import { ComicEngine, createComicEngine } from '@/domain/comic-engine';
+import { ComicEngine, createComicEngine, groupPanelsByTier } from '@/domain/comic-engine';
 import { createBrowserStorageAdapter } from '@/domain/indexeddb-storage';
+import {
+  downloadJsonFile,
+  extractClipboardImageAsDataUrl,
+  readFileAsDataUrl,
+  readFileAsText,
+} from './file-utils';
+import { StagedDiffBanner } from './staged-diff-banner';
+import { StoryBibleTab, StoryBibleView } from './story-bible-view';
 
 export interface ComicStudioProps {
   storage?: ComicStorageAdapter;
@@ -27,7 +33,6 @@ export interface ComicStudioProps {
 }
 
 type WorkspaceMode = 'initiation' | 'story-bible' | 'canvas';
-type StoryBibleTab = 'characters' | 'locations' | 'props' | 'visual-style';
 type RightDockTab = 'refine' | 'inspector' | 'image-prompts';
 
 const HEIGHT_CLASS_MAP: Record<PanelHeightWeight, string> = {
@@ -55,12 +60,10 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
   const [activeLocationId, setActiveLocationId] = useState<string | null>(null);
   const [activePropId, setActivePropId] = useState<string | null>(null);
 
-  // Initiation options
   const [targetPageCount, setTargetPageCount] = useState<number>(3);
   const [panelDensity, setPanelDensity] = useState<string>('medium (4-6 panels/page)');
   const [initBespokeInstruction, setInitBespokeInstruction] = useState<string>('');
 
-  // Selection & LLM Clipboard Bridge state
   const [selection, setSelection] = useState<SelectionTarget>({
     scope: 'pages',
     selectedIds: [],
@@ -69,9 +72,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
   const [rawLlmInput, setRawLlmInput] = useState<string>('');
   const [importError, setImportError] = useState<string | null>(null);
   const [statusToast, setStatusToast] = useState<string | null>(null);
-  const [lastCopiedPrompt, setLastCopiedPrompt] = useState<string>('');
 
-  // Image prompt state
   const [selectedImagePageIds, setSelectedImagePageIds] = useState<string[]>([]);
   const [deliveryMode, setDeliveryMode] = useState<ImagePromptDeliveryMode>('composite-spread');
   const [letteringMode, setLetteringMode] = useState<LetteringMode>('baked-in');
@@ -111,7 +112,6 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
   }, [storage]);
 
   const copyText = async (text: string, label: string) => {
-    setLastCopiedPrompt(text);
     if (onCopyToClipboard) {
       await onCopyToClipboard(text);
     } else if (typeof navigator !== 'undefined' && navigator.clipboard) {
@@ -150,13 +150,26 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
       selectedImagePageIds.length > 0
         ? selectedImagePageIds
         : comic.pages.slice(0, 1).map((p) => p.id);
+    const panelIds =
+      selection.scope === 'panels' && selection.selectedIds.length > 0
+        ? selection.selectedIds
+        : undefined;
     return engine.buildImagePrompts({
       pageIds: targetIds,
+      panelIds,
       deliveryMode,
       letteringMode,
       bespokeInstruction: imageBespokeInstruction || undefined,
     });
-  }, [engine, comic, selectedImagePageIds, deliveryMode, letteringMode, imageBespokeInstruction]);
+  }, [
+    engine,
+    comic,
+    selectedImagePageIds,
+    selection,
+    deliveryMode,
+    letteringMode,
+    imageBespokeInstruction,
+  ]);
 
   if (!engine || !comic) {
     return (
@@ -282,7 +295,11 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
     await copyText(prompt, 'Selection prompt');
   };
 
-  // Resolve active selected object for direct inspector editing
+  const selectedScene =
+    selection.scope === 'scenes'
+      ? comic.scenes.find((s) => s.id === selection.selectedIds[0])
+      : undefined;
+
   const selectedPage =
     selection.scope === 'pages'
       ? comic.pages.find((p) => p.id === selection.selectedIds[0])
@@ -311,7 +328,22 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
       : undefined;
 
   return (
-    <div className="flex h-screen flex-col bg-slate-950 text-slate-100">
+    <div
+      className="flex h-screen flex-col bg-slate-950 text-slate-100"
+      onPaste={(e) => {
+        if (selectedPanel) {
+          extractClipboardImageAsDataUrl(e.clipboardData, (dataUrl) => {
+            engine.attachPanelImage(selectedPanel.pageId, selectedPanel.panel.id, dataUrl);
+            setStatusToast('Clipboard image attached to Panel.');
+          });
+        } else if (selectedPage) {
+          extractClipboardImageAsDataUrl(e.clipboardData, (dataUrl) => {
+            engine.attachPageImage(selectedPage.id, dataUrl);
+            setStatusToast('Clipboard image attached to Page.');
+          });
+        }
+      }}
+    >
       {/* Top Studio Bar */}
       <header className="flex items-center justify-between border-b border-slate-800 bg-slate-900/90 px-4 py-2.5">
         <div className="flex items-center gap-3">
@@ -337,6 +369,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
             type="button"
             onClick={() => {
               const json = engine.exportComicJson();
+              downloadJsonFile(`${comic.title.toLowerCase().replace(/\s+/g, '-') || 'comic'}.json`, json);
               void copyText(json, 'Full Comic JSON');
             }}
             className="rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-200 hover:bg-slate-700"
@@ -352,67 +385,27 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               onChange={(e) => {
                 const file = e.target.files?.[0];
                 if (!file) return;
-                const reader = new FileReader();
-                reader.onload = () => {
+                readFileAsText(file, (content) => {
                   try {
-                    engine.importComicJson(String(reader.result || ''));
-                    setStatusToast('Comic JSON project imported.');
+                    engine.importComicJson(content);
+                    setStatusToast('Comic JSON imported.');
                   } catch (err) {
                     setImportError(err instanceof Error ? err.message : 'Invalid Comic JSON');
                   }
-                };
-                reader.readAsText(file);
+                });
               }}
             />
           </label>
         </div>
       </header>
 
-      {/* Staged Diff Review Banner / Modal */}
       {stagedDiff && (
-        <div
-          role="region"
-          aria-label="Staged Diff Review"
-          className="border-b border-amber-500/50 bg-amber-950/40 px-6 py-4"
-        >
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-sm font-bold text-amber-300 uppercase tracking-wide">
-                Staged Diff Review — {stagedDiff.summary}
-              </h2>
-              {stagedDiff.warnings.length > 0 && (
-                <ul className="mt-1 list-disc pl-5 text-xs text-amber-200">
-                  {stagedDiff.warnings.map((w, idx) => (
-                    <li key={idx}>{w}</li>
-                  ))}
-                </ul>
-              )}
-              {stagedDiff.kind === 'targeted-patch' && (
-                <p className="mt-1 text-xs text-slate-300">
-                  Scope: <strong>{stagedDiff.scope}</strong> | Replacing{' '}
-                  <strong>{stagedDiff.selectedIds.join(', ')}</strong> ({stagedDiff.before.length}{' '}
-                  before → {stagedDiff.replacements.length} after)
-                </p>
-              )}
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={handleApplyStagedDiff}
-                className="rounded bg-emerald-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
-              >
-                Accept & Apply Changes
-              </button>
-              <button
-                type="button"
-                onClick={handleDiscardStagedDiff}
-                className="rounded border border-slate-600 bg-slate-800 px-3 py-1.5 text-xs text-slate-200 hover:bg-slate-700"
-              >
-                Discard
-              </button>
-            </div>
-          </div>
-        </div>
+        <StagedDiffBanner
+          comic={comic}
+          stagedDiff={stagedDiff}
+          onAccept={handleApplyStagedDiff}
+          onDiscard={handleDiscardStagedDiff}
+        />
       )}
 
       {/* Main 3-Pane Workspace */}
@@ -461,31 +454,47 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               <span>Scenes ({comic.scenes.length})</span>
               <button
                 type="button"
-                onClick={() =>
-                  engine.upsertScene({
+                onClick={() => {
+                  const s = engine.upsertScene({
                     title: `Scene ${comic.scenes.length + 1}`,
                     summary: '',
                     dramaticBeat: '',
                     participatingCharacterIds: [],
-                  })
-                }
+                  });
+                  handleSelectElement('scenes', s.id);
+                  setRightTab('inspector');
+                }}
                 className="text-amber-400 hover:text-amber-300"
               >
                 + Scene
               </button>
             </div>
             <ul className="mt-2 space-y-1 text-xs">
-              {comic.scenes.map((scene) => (
-                <li
-                  key={scene.id}
-                  className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5 text-slate-300"
-                >
-                  <div className="font-medium text-amber-200">{scene.title}</div>
-                  {scene.summary && (
-                    <div className="truncate text-[11px] text-slate-400">{scene.summary}</div>
-                  )}
-                </li>
-              ))}
+              {comic.scenes.map((scene) => {
+                const isSceneSelected =
+                  selection.scope === 'scenes' && selection.selectedIds.includes(scene.id);
+                return (
+                  <li key={scene.id}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleSelectElement('scenes', scene.id);
+                        setRightTab('inspector');
+                      }}
+                      className={`w-full rounded border px-2 py-1.5 text-left ${
+                        isSceneSelected
+                          ? 'border-amber-400 bg-amber-500/20 text-white'
+                          : 'border-slate-800 bg-slate-950/60 text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      <div className="font-medium text-amber-200">{scene.title}</div>
+                      {scene.summary && (
+                        <div className="truncate text-[11px] text-slate-400">{scene.summary}</div>
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           </div>
 
@@ -540,7 +549,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                   Initiation Phase — Manuscript to Comic Draft
                 </h1>
                 <p className="text-xs text-slate-400">
-                  Paste or upload your manuscript below. Click &ldquo;Copy Initiation Prompt&rdquo;
+                  Paste or upload your Manuscript below. Click &ldquo;Copy Initiation Prompt&rdquo;
                   to bundle your Manuscript, Story Bible Assets, bespoke instructions, and required
                   JSON format into the clipboard for your LLM.
                 </p>
@@ -563,11 +572,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                       onChange={(e) => {
                         const file = e.target.files?.[0];
                         if (!file) return;
-                        const reader = new FileReader();
-                        reader.onload = () => {
-                          engine.updateManuscript(String(reader.result || ''));
-                        };
-                        reader.readAsText(file);
+                        readFileAsText(file, (content) => engine.updateManuscript(content));
                       }}
                     />
                   </label>
@@ -578,7 +583,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                   rows={10}
                   value={comic.manuscript}
                   onChange={(e) => engine.updateManuscript(e.target.value)}
-                  placeholder="Paste your story manuscript, scene outline, or script here..."
+                  placeholder="Paste your story manuscript, scene outline, or prose here..."
                   className="w-full rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm text-slate-100 focus:border-amber-400 focus:outline-none"
                 />
               </div>
@@ -647,650 +652,22 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
           )}
 
           {mode === 'story-bible' && (
-            <div className="space-y-6">
-              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setBibleTab('characters')}
-                    className={`rounded px-3 py-1.5 text-xs font-semibold ${
-                      bibleTab === 'characters'
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'bg-slate-800 text-slate-300'
-                    }`}
-                  >
-                    Characters ({comic.storyBible.characters.length})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBibleTab('locations')}
-                    className={`rounded px-3 py-1.5 text-xs font-semibold ${
-                      bibleTab === 'locations'
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'bg-slate-800 text-slate-300'
-                    }`}
-                  >
-                    Locations ({comic.storyBible.locations.length})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBibleTab('props')}
-                    className={`rounded px-3 py-1.5 text-xs font-semibold ${
-                      bibleTab === 'props'
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'bg-slate-800 text-slate-300'
-                    }`}
-                  >
-                    Props ({comic.storyBible.props.length})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBibleTab('visual-style')}
-                    className={`rounded px-3 py-1.5 text-xs font-semibold ${
-                      bibleTab === 'visual-style'
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'bg-slate-800 text-slate-300'
-                    }`}
-                  >
-                    Visual Style
-                  </button>
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={handleAddCharacter}
-                    className="rounded border border-amber-500/50 bg-amber-500/10 px-3 py-1 text-xs font-semibold text-amber-300 hover:bg-amber-500/20"
-                  >
-                    + New Character
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleAddLocation}
-                    className="rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-700"
-                  >
-                    + New Location
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleAddProp}
-                    className="rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-700"
-                  >
-                    + New Prop
-                  </button>
-                </div>
-              </div>
-
-              {bibleTab === 'characters' && (
-                <div className="grid grid-cols-12 gap-4">
-                  <div className="col-span-4 space-y-1.5">
-                    {comic.storyBible.characters.map((c) => (
-                      <button
-                        key={c.id}
-                        type="button"
-                        onClick={() => {
-                          setActiveCharacterId(c.id);
-                          handleSelectElement('characters', c.id);
-                        }}
-                        className={`w-full rounded border p-2.5 text-left text-xs ${
-                          activeCharacter?.id === c.id
-                            ? 'border-amber-500 bg-amber-500/10 text-white'
-                            : 'border-slate-800 bg-slate-900 text-slate-300 hover:bg-slate-800'
-                        }`}
-                      >
-                        <div className="font-bold">{c.name}</div>
-                        <div className="text-[11px] uppercase text-amber-400">{c.role}</div>
-                      </button>
-                    ))}
-                  </div>
-
-                  <div className="col-span-8">
-                    {activeCharacter ? (
-                      <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-                        <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <label
-                              htmlFor="char-name-input"
-                              className="block text-xs font-semibold text-slate-300"
-                            >
-                              Character Name
-                            </label>
-                            <input
-                              id="char-name-input"
-                              aria-label="Character Name"
-                              value={activeCharacter.name}
-                              onChange={(e) =>
-                                engine.upsertCharacter({
-                                  ...activeCharacter,
-                                  name: e.target.value,
-                                })
-                              }
-                              className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-sm text-white"
-                            />
-                          </div>
-                          <div>
-                            <label
-                              htmlFor="char-role-select"
-                              className="block text-xs font-semibold text-slate-300"
-                            >
-                              Narrative Role
-                            </label>
-                            <select
-                              id="char-role-select"
-                              value={activeCharacter.role}
-                              onChange={(e) =>
-                                engine.upsertCharacter({
-                                  ...activeCharacter,
-                                  role: e.target.value as CharacterRole,
-                                })
-                              }
-                              className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-sm text-white"
-                            >
-                              <option value="protagonist">Protagonist</option>
-                              <option value="antagonist">Antagonist</option>
-                              <option value="supporting">Supporting</option>
-                              <option value="minor">Minor</option>
-                            </select>
-                          </div>
-                        </div>
-
-                        <fieldset className="space-y-2 rounded border border-slate-800 p-3">
-                          <legend className="px-1 text-xs font-bold uppercase text-amber-400">
-                            Appearance
-                          </legend>
-                          <div>
-                            <label
-                              htmlFor="char-tag-input"
-                              className="block text-xs font-semibold text-slate-300"
-                            >
-                              Visual Prompt Tag
-                            </label>
-                            <input
-                              id="char-tag-input"
-                              aria-label="Visual Prompt Tag"
-                              value={activeCharacter.appearance.visualPromptTag}
-                              onChange={(e) =>
-                                engine.upsertCharacter({
-                                  ...activeCharacter,
-                                  appearance: {
-                                    ...activeCharacter.appearance,
-                                    visualPromptTag: e.target.value,
-                                  },
-                                })
-                              }
-                              placeholder="Concise visual descriptor injected into image prompts..."
-                              className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                            />
-                          </div>
-                          <div className="grid grid-cols-2 gap-2">
-                            <input
-                              aria-label="Age and Build"
-                              placeholder="Age & Build"
-                              value={activeCharacter.appearance.ageAndBuild}
-                              onChange={(e) =>
-                                engine.upsertCharacter({
-                                  ...activeCharacter,
-                                  appearance: {
-                                    ...activeCharacter.appearance,
-                                    ageAndBuild: e.target.value,
-                                  },
-                                })
-                              }
-                              className="rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                            />
-                            <input
-                              aria-label="Facial Features and Hair"
-                              placeholder="Facial Features & Hair"
-                              value={activeCharacter.appearance.facialFeaturesAndHair}
-                              onChange={(e) =>
-                                engine.upsertCharacter({
-                                  ...activeCharacter,
-                                  appearance: {
-                                    ...activeCharacter.appearance,
-                                    facialFeaturesAndHair: e.target.value,
-                                  },
-                                })
-                              }
-                              className="rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                            />
-                            <input
-                              aria-label="Signature Outfit and Colors"
-                              placeholder="Signature Outfit & Colors"
-                              value={activeCharacter.appearance.signatureOutfitAndColors}
-                              onChange={(e) =>
-                                engine.upsertCharacter({
-                                  ...activeCharacter,
-                                  appearance: {
-                                    ...activeCharacter.appearance,
-                                    signatureOutfitAndColors: e.target.value,
-                                  },
-                                })
-                              }
-                              className="rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                            />
-                            <input
-                              aria-label="Distinguishing Marks"
-                              placeholder="Distinguishing Marks"
-                              value={activeCharacter.appearance.distinguishingMarks}
-                              onChange={(e) =>
-                                engine.upsertCharacter({
-                                  ...activeCharacter,
-                                  appearance: {
-                                    ...activeCharacter.appearance,
-                                    distinguishingMarks: e.target.value,
-                                  },
-                                })
-                              }
-                              className="rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                            />
-                          </div>
-                        </fieldset>
-
-                        <fieldset className="space-y-2 rounded border border-slate-800 p-3">
-                          <legend className="px-1 text-xs font-bold uppercase text-amber-400">
-                            Personality & Voice
-                          </legend>
-                          <input
-                            aria-label="Character Aliases"
-                            placeholder="Aliases (comma-separated)"
-                            value={activeCharacter.aliases.join(', ')}
-                            onChange={(e) =>
-                              engine.upsertCharacter({
-                                ...activeCharacter,
-                                aliases: e.target.value
-                                  .split(',')
-                                  .map((s) => s.trim())
-                                  .filter(Boolean),
-                              })
-                            }
-                            className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                          />
-                          <input
-                            aria-label="Core Traits"
-                            placeholder="Core Traits (comma-separated)"
-                            value={activeCharacter.personality.coreTraits.join(', ')}
-                            onChange={(e) =>
-                              engine.upsertCharacter({
-                                ...activeCharacter,
-                                personality: {
-                                  ...activeCharacter.personality,
-                                  coreTraits: e.target.value
-                                    .split(',')
-                                    .map((s) => s.trim())
-                                    .filter(Boolean),
-                                },
-                              })
-                            }
-                            className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                          />
-                          <input
-                            aria-label="Voice and Speech Style"
-                            placeholder="Voice & Speech Style (guides dialogue generation)"
-                            value={activeCharacter.personality.voiceAndSpeechStyle}
-                            onChange={(e) =>
-                              engine.upsertCharacter({
-                                ...activeCharacter,
-                                personality: {
-                                  ...activeCharacter.personality,
-                                  voiceAndSpeechStyle: e.target.value,
-                                },
-                              })
-                            }
-                            className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                          />
-                          <input
-                            aria-label="Quirks and Mannerisms"
-                            placeholder="Quirks & Mannerisms"
-                            value={activeCharacter.personality.quirksAndMannerisms}
-                            onChange={(e) =>
-                              engine.upsertCharacter({
-                                ...activeCharacter,
-                                personality: {
-                                  ...activeCharacter.personality,
-                                  quirksAndMannerisms: e.target.value,
-                                },
-                              })
-                            }
-                            className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                          />
-                        </fieldset>
-
-                        <fieldset className="space-y-2 rounded border border-slate-800 p-3">
-                          <legend className="px-1 text-xs font-bold uppercase text-amber-400">
-                            Motivation & Background
-                          </legend>
-                          <input
-                            aria-label="Primary Goal"
-                            placeholder="Primary Goal"
-                            value={activeCharacter.motivation.primaryGoal}
-                            onChange={(e) =>
-                              engine.upsertCharacter({
-                                ...activeCharacter,
-                                motivation: {
-                                  ...activeCharacter.motivation,
-                                  primaryGoal: e.target.value,
-                                },
-                              })
-                            }
-                            className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                          />
-                          <input
-                            aria-label="Core Fear or Conflict"
-                            placeholder="Core Fear or Conflict"
-                            value={activeCharacter.motivation.coreFearOrConflict}
-                            onChange={(e) =>
-                              engine.upsertCharacter({
-                                ...activeCharacter,
-                                motivation: {
-                                  ...activeCharacter.motivation,
-                                  coreFearOrConflict: e.target.value,
-                                },
-                              })
-                            }
-                            className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                          />
-                          <input
-                            aria-label="Moral Alignment or Code"
-                            placeholder="Moral Alignment or Code"
-                            value={activeCharacter.motivation.moralAlignmentOrCode}
-                            onChange={(e) =>
-                              engine.upsertCharacter({
-                                ...activeCharacter,
-                                motivation: {
-                                  ...activeCharacter.motivation,
-                                  moralAlignmentOrCode: e.target.value,
-                                },
-                              })
-                            }
-                            className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
-                          />
-                          <textarea
-                            aria-label="Background Summary"
-                            placeholder="Backstory summary..."
-                            rows={3}
-                            value={activeCharacter.background.summary}
-                            onChange={(e) =>
-                              engine.upsertCharacter({
-                                ...activeCharacter,
-                                background: {
-                                  ...activeCharacter.background,
-                                  summary: e.target.value,
-                                },
-                              })
-                            }
-                            className="w-full rounded border border-slate-700 bg-slate-950 p-2 text-xs text-white"
-                          />
-                        </fieldset>
-                      </div>
-                    ) : (
-                      <p className="text-xs text-slate-400">
-                        Click &ldquo;+ New Character&rdquo; to define a character in your Story
-                        Bible.
-                      </p>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {bibleTab === 'locations' && (
-                <div className="grid grid-cols-12 gap-4">
-                  <div className="col-span-4 space-y-1.5">
-                    {comic.storyBible.locations.map((l) => (
-                      <button
-                        key={l.id}
-                        type="button"
-                        onClick={() => {
-                          setActiveLocationId(l.id);
-                          handleSelectElement('locations', l.id);
-                        }}
-                        className={`w-full rounded border p-2.5 text-left text-xs ${
-                          activeLocation?.id === l.id
-                            ? 'border-amber-500 bg-amber-500/10 text-white'
-                            : 'border-slate-800 bg-slate-900 text-slate-300'
-                        }`}
-                      >
-                        <div className="font-bold">{l.name}</div>
-                        <div className="text-[11px] uppercase text-slate-400">{l.type}</div>
-                      </button>
-                    ))}
-                  </div>
-                  <div className="col-span-8">
-                    {activeLocation ? (
-                      <div className="space-y-3 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-                        <input
-                          aria-label="Location Name"
-                          value={activeLocation.name}
-                          onChange={(e) =>
-                            engine.upsertLocation({ ...activeLocation, name: e.target.value })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-1.5 text-sm text-white"
-                        />
-                        <select
-                          aria-label="Location Type"
-                          value={activeLocation.type}
-                          onChange={(e) =>
-                            engine.upsertLocation({
-                              ...activeLocation,
-                              type: e.target.value as LocationType,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-white"
-                        >
-                          <option value="exterior">Exterior</option>
-                          <option value="interior">Interior</option>
-                          <option value="mixed">Mixed</option>
-                        </select>
-                        <input
-                          aria-label="Location Visual Prompt Tag"
-                          placeholder="Visual Prompt Tag"
-                          value={activeLocation.visualPromptTag}
-                          onChange={(e) =>
-                            engine.upsertLocation({
-                              ...activeLocation,
-                              visualPromptTag: e.target.value,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-white"
-                        />
-                        <textarea
-                          aria-label="Architecture and Scale"
-                          placeholder="Architecture & Scale"
-                          rows={2}
-                          value={activeLocation.architectureAndScale}
-                          onChange={(e) =>
-                            engine.upsertLocation({
-                              ...activeLocation,
-                              architectureAndScale: e.target.value,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 p-2 text-xs text-white"
-                        />
-                        <textarea
-                          aria-label="Lighting and Atmosphere"
-                          placeholder="Lighting & Atmosphere"
-                          rows={2}
-                          value={activeLocation.lightingAndAtmosphere}
-                          onChange={(e) =>
-                            engine.upsertLocation({
-                              ...activeLocation,
-                              lightingAndAtmosphere: e.target.value,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 p-2 text-xs text-white"
-                        />
-                        <input
-                          aria-label="Key Visual Landmarks"
-                          placeholder="Key Visual Landmarks (comma-separated)"
-                          value={activeLocation.keyVisualLandmarks.join(', ')}
-                          onChange={(e) =>
-                            engine.upsertLocation({
-                              ...activeLocation,
-                              keyVisualLandmarks: e.target.value
-                                .split(',')
-                                .map((s) => s.trim())
-                                .filter(Boolean),
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-white"
-                        />
-                        <textarea
-                          aria-label="Lore and Context"
-                          placeholder="Lore & Context"
-                          rows={2}
-                          value={activeLocation.loreAndContext}
-                          onChange={(e) =>
-                            engine.upsertLocation({
-                              ...activeLocation,
-                              loreAndContext: e.target.value,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 p-2 text-xs text-white"
-                        />
-                      </div>
-                    ) : (
-                      <p className="text-xs text-slate-400">
-                        Click &ldquo;+ New Location&rdquo; to define a location.
-                      </p>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {bibleTab === 'props' && (
-                <div className="grid grid-cols-12 gap-4">
-                  <div className="col-span-4 space-y-1.5">
-                    {comic.storyBible.props.map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        onClick={() => {
-                          setActivePropId(p.id);
-                          handleSelectElement('props', p.id);
-                        }}
-                        className={`w-full rounded border p-2.5 text-left text-xs ${
-                          activeProp?.id === p.id
-                            ? 'border-amber-500 bg-amber-500/10 text-white'
-                            : 'border-slate-800 bg-slate-900 text-slate-300'
-                        }`}
-                      >
-                        <div className="font-bold">{p.name}</div>
-                        <div className="text-[11px] text-slate-400">{p.category}</div>
-                      </button>
-                    ))}
-                  </div>
-                  <div className="col-span-8">
-                    {activeProp ? (
-                      <div className="space-y-3 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-                        <input
-                          aria-label="Prop Name"
-                          value={activeProp.name}
-                          onChange={(e) =>
-                            engine.upsertProp({ ...activeProp, name: e.target.value })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-1.5 text-sm text-white"
-                        />
-                        <input
-                          aria-label="Prop Visual Prompt Tag"
-                          placeholder="Visual Prompt Tag"
-                          value={activeProp.visualPromptTag}
-                          onChange={(e) =>
-                            engine.upsertProp({
-                              ...activeProp,
-                              visualPromptTag: e.target.value,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-white"
-                        />
-                        <textarea
-                          aria-label="Prop Visual Description"
-                          placeholder="Visual Description"
-                          rows={2}
-                          value={activeProp.visualDescription}
-                          onChange={(e) =>
-                            engine.upsertProp({
-                              ...activeProp,
-                              visualDescription: e.target.value,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 p-2 text-xs text-white"
-                        />
-                        <input
-                          aria-label="Prop Category"
-                          placeholder="Category (e.g. artifact, vehicle, weapon)"
-                          value={activeProp.category}
-                          onChange={(e) =>
-                            engine.upsertProp({
-                              ...activeProp,
-                              category: e.target.value,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-white"
-                        />
-                        <textarea
-                          aria-label="Prop Narrative Purpose"
-                          placeholder="Narrative Purpose"
-                          rows={2}
-                          value={activeProp.narrativePurpose}
-                          onChange={(e) =>
-                            engine.upsertProp({
-                              ...activeProp,
-                              narrativePurpose: e.target.value,
-                            })
-                          }
-                          className="w-full rounded border border-slate-700 bg-slate-950 p-2 text-xs text-white"
-                        />
-                      </div>
-                    ) : (
-                      <p className="text-xs text-slate-400">
-                        Click &ldquo;+ New Prop&rdquo; to define a prop.
-                      </p>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {bibleTab === 'visual-style' && (
-                <div className="space-y-3 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-                  <input
-                    aria-label="Art Tradition"
-                    placeholder="Art Tradition (e.g. Ligne Claire, Manga, Noir Ink)"
-                    value={comic.storyBible.visualStyle.artTradition}
-                    onChange={(e) => engine.updateVisualStyle({ artTradition: e.target.value })}
-                    className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-                  />
-                  <input
-                    aria-label="Line and Inking"
-                    placeholder="Line & Inking"
-                    value={comic.storyBible.visualStyle.lineAndInking}
-                    onChange={(e) => engine.updateVisualStyle({ lineAndInking: e.target.value })}
-                    className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-                  />
-                  <input
-                    aria-label="Color Palette and Shading"
-                    placeholder="Color Palette & Shading"
-                    value={comic.storyBible.visualStyle.colorPaletteAndShading}
-                    onChange={(e) =>
-                      engine.updateVisualStyle({ colorPaletteAndShading: e.target.value })
-                    }
-                    className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-                  />
-                  <input
-                    aria-label="Era and Tone"
-                    placeholder="Era & Tone"
-                    value={comic.storyBible.visualStyle.eraAndTone}
-                    onChange={(e) => engine.updateVisualStyle({ eraAndTone: e.target.value })}
-                    className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-                  />
-                  <input
-                    aria-label="Negative Prompt"
-                    placeholder="Negative Prompt / Avoid in artwork"
-                    value={comic.storyBible.visualStyle.negativePrompt}
-                    onChange={(e) => engine.updateVisualStyle({ negativePrompt: e.target.value })}
-                    className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-white"
-                  />
-                </div>
-              )}
-            </div>
+            <StoryBibleView
+              comic={comic}
+              engine={engine}
+              bibleTab={bibleTab}
+              setBibleTab={setBibleTab}
+              activeCharacter={activeCharacter}
+              setActiveCharacterId={setActiveCharacterId}
+              activeLocation={activeLocation}
+              setActiveLocationId={setActiveLocationId}
+              activeProp={activeProp}
+              setActivePropId={setActivePropId}
+              onSelectElement={handleSelectElement}
+              onAddCharacter={handleAddCharacter}
+              onAddLocation={handleAddLocation}
+              onAddProp={handleAddProp}
+            />
           )}
 
           {mode === 'canvas' && (
@@ -1298,8 +675,8 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               {comic.pages.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-slate-800 p-12 text-center">
                   <p className="text-sm text-slate-300">
-                    No comic pages yet. Start in <strong>Initiation & Manuscript</strong> to
-                    generate a draft from your manuscript, or click <strong>+ Page</strong> in the
+                    No comic Pages yet. Start in <strong>Initiation & Manuscript</strong> to
+                    generate a draft from your Manuscript, or click <strong>+ Page</strong> in the
                     left sidebar.
                   </p>
                 </div>
@@ -1307,6 +684,9 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                 comic.pages.map((page) => {
                   const isPageSelected =
                     selection.scope === 'pages' && selection.selectedIds.includes(page.id);
+                  const tiers = groupPanelsByTier(page.panels);
+                  const sortedTierRows = Array.from(tiers.keys()).sort((a, b) => a - b);
+
                   return (
                     <section
                       key={page.id}
@@ -1354,11 +734,9 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                               onChange={(e) => {
                                 const file = e.target.files?.[0];
                                 if (!file) return;
-                                const reader = new FileReader();
-                                reader.onload = () => {
-                                  engine.attachPageImage(page.id, String(reader.result || ''));
-                                };
-                                reader.readAsDataURL(file);
+                                readFileAsDataUrl(file, (dataUrl) =>
+                                  engine.attachPageImage(page.id, dataUrl)
+                                );
                               }}
                             />
                           </label>
@@ -1383,103 +761,156 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                       )}
 
                       {/* 12-Column Tiered Panel Grid */}
-                      <div className="grid grid-cols-12 gap-3">
-                        {page.panels.map((panel, panelIdx) => {
-                          const isPanelSelected =
-                            selection.scope === 'panels' &&
-                            selection.selectedIds.includes(panel.id);
-                          const scene = comic.scenes.find((s) => s.id === panel.sceneId);
-
+                      <div className="space-y-3">
+                        {sortedTierRows.map((rowNum) => {
+                          const rowPanels = tiers.get(rowNum) ?? [];
                           return (
-                            <div
-                              key={panel.id}
-                              style={COL_SPAN_STYLE(panel.colSpan)}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleSelectElement(
-                                  'panels',
-                                  panel.id,
-                                  page.id,
-                                  e.shiftKey || e.ctrlKey
+                            <div key={rowNum} className="grid grid-cols-12 gap-3">
+                              {rowPanels.map((panel) => {
+                                const isPanelSelected =
+                                  selection.scope === 'panels' &&
+                                  selection.selectedIds.includes(panel.id);
+                                const scene = comic.scenes.find((s) => s.id === panel.sceneId);
+                                const panelLocation = comic.storyBible.locations.find(
+                                  (l) => l.id === panel.locationId
                                 );
-                              }}
-                              className={`flex flex-col justify-between rounded-lg border-2 bg-slate-950 p-3.5 transition cursor-pointer ${
-                                HEIGHT_CLASS_MAP[panel.heightWeight]
-                              } ${
-                                isPanelSelected
-                                  ? 'border-amber-400 ring-2 ring-amber-400/20'
-                                  : 'border-slate-700 hover:border-slate-500'
-                              }`}
-                            >
-                              <div className="space-y-2">
-                                <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
-                                  <span className="font-bold text-amber-300">
-                                    P{panelIdx + 1} · Tier {panel.row} ({panel.colSpan}/12)
-                                  </span>
-                                  <div className="flex items-center gap-1">
-                                    <span className="rounded bg-slate-800 px-1.5 py-0.5 text-slate-300">
-                                      {panel.framing}
-                                    </span>
-                                    {scene && (
-                                      <span className="rounded bg-indigo-950/80 px-1.5 py-0.5 text-indigo-300">
-                                        {scene.title}
-                                      </span>
-                                    )}
-                                  </div>
-                                </div>
+                                const panelCharacters = comic.storyBible.characters.filter((c) =>
+                                  panel.characterIds.includes(c.id)
+                                );
+                                const panelProps = comic.storyBible.props.filter((pr) =>
+                                  panel.propIds.includes(pr.id)
+                                );
 
-                                <p className="text-xs leading-relaxed text-slate-200">
-                                  {panel.visualDescription}
-                                </p>
-                              </div>
-
-                              {/* Panel Text Elements (Dialogue, Captions, SFX) */}
-                              <div className="mt-3 space-y-1.5">
-                                {panel.textElements.map((txt) => {
-                                  const isTxtSelected =
-                                    selection.scope === 'text-elements' &&
-                                    selection.selectedIds.includes(txt.id);
-                                  const speakerName =
-                                    txt.kind === 'dialogue'
-                                      ? comic.storyBible.characters.find(
-                                          (c) => c.id === txt.characterId
-                                        )?.name ||
-                                        txt.speakerName ||
-                                        'Speaker'
-                                      : null;
-
-                                  return (
-                                    <div
-                                      key={txt.id}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleSelectElement(
-                                          'text-elements',
-                                          txt.id,
-                                          panel.id,
-                                          e.shiftKey || e.ctrlKey
-                                        );
-                                      }}
-                                      className={`rounded-md border px-2.5 py-1.5 text-xs transition ${
-                                        isTxtSelected
-                                          ? 'border-amber-400 bg-amber-500/20 text-white'
-                                          : txt.kind === 'caption'
-                                            ? 'border-amber-700/40 bg-amber-950/30 text-amber-200 italic'
-                                            : txt.kind === 'sfx'
-                                              ? 'border-rose-700/40 bg-rose-950/30 font-black tracking-wider text-rose-300 uppercase'
-                                              : 'border-slate-700 bg-slate-900 text-slate-100 hover:border-slate-500'
-                                      }`}
-                                    >
-                                      {txt.kind === 'dialogue' && (
-                                        <span className="mr-1.5 font-bold text-amber-300">
-                                          {speakerName}:
+                                return (
+                                  <div
+                                    key={panel.id}
+                                    style={COL_SPAN_STYLE(panel.colSpan)}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleSelectElement(
+                                        'panels',
+                                        panel.id,
+                                        page.id,
+                                        e.shiftKey || e.ctrlKey
+                                      );
+                                    }}
+                                    className={`flex flex-col justify-between rounded-lg border-2 bg-slate-950 p-3.5 transition cursor-pointer ${
+                                      HEIGHT_CLASS_MAP[panel.heightWeight]
+                                    } ${
+                                      isPanelSelected
+                                        ? 'border-amber-400 ring-2 ring-amber-400/20'
+                                        : 'border-slate-700 hover:border-slate-500'
+                                    }`}
+                                  >
+                                    <div className="space-y-2">
+                                      <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
+                                        <span className="font-bold text-amber-300">
+                                          Tier {panel.row} ({panel.colSpan}/12 · {panel.heightWeight})
                                         </span>
+                                        <div className="flex items-center gap-1">
+                                          <span className="rounded bg-slate-800 px-1.5 py-0.5 text-slate-300">
+                                            {panel.framing}
+                                          </span>
+                                          {scene && (
+                                            <span className="rounded bg-indigo-950/80 px-1.5 py-0.5 text-indigo-300">
+                                              {scene.title}
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+
+                                      {/* Participating Asset Pills */}
+                                      {(panelLocation ||
+                                        panelCharacters.length > 0 ||
+                                        panelProps.length > 0) && (
+                                        <div className="flex flex-wrap gap-1 text-[10px]">
+                                          {panelLocation && (
+                                            <span className="rounded bg-emerald-950/80 px-1.5 py-0.5 text-emerald-300">
+                                              📍 {panelLocation.name}
+                                            </span>
+                                          )}
+                                          {panelCharacters.map((c) => (
+                                            <span
+                                              key={c.id}
+                                              className="rounded bg-amber-950/80 px-1.5 py-0.5 text-amber-200"
+                                            >
+                                              👤 {c.name}
+                                            </span>
+                                          ))}
+                                          {panelProps.map((pr) => (
+                                            <span
+                                              key={pr.id}
+                                              className="rounded bg-sky-950/80 px-1.5 py-0.5 text-sky-200"
+                                            >
+                                              ⚙️ {pr.name}
+                                            </span>
+                                          ))}
+                                        </div>
                                       )}
-                                      <span>{txt.text}</span>
+
+                                      {panel.renderedImageDataUrl && (
+                                        <img
+                                          src={panel.renderedImageDataUrl}
+                                          alt="Rendered Panel"
+                                          className="max-h-48 w-full rounded border border-slate-800 object-contain bg-black"
+                                        />
+                                      )}
+
+                                      <p className="text-xs leading-relaxed text-slate-200">
+                                        {panel.visualDescription}
+                                      </p>
                                     </div>
-                                  );
-                                })}
-                              </div>
+
+                                    {/* Panel Text Elements (Dialogue, Captions, SFX) */}
+                                    <div className="mt-3 space-y-1.5">
+                                      {panel.textElements.map((txt) => {
+                                        const isTxtSelected =
+                                          selection.scope === 'text-elements' &&
+                                          selection.selectedIds.includes(txt.id);
+                                        const speakerName =
+                                          txt.kind === 'dialogue'
+                                            ? comic.storyBible.characters.find(
+                                                (c) => c.id === txt.characterId
+                                              )?.name ||
+                                              txt.speakerName ||
+                                              'Speaker'
+                                            : null;
+
+                                        return (
+                                          <div
+                                            key={txt.id}
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              handleSelectElement(
+                                                'text-elements',
+                                                txt.id,
+                                                panel.id,
+                                                e.shiftKey || e.ctrlKey
+                                              );
+                                            }}
+                                            className={`rounded-md border px-2.5 py-1.5 text-xs transition ${
+                                              isTxtSelected
+                                                ? 'border-amber-400 bg-amber-500/20 text-white'
+                                                : txt.kind === 'caption'
+                                                  ? 'border-amber-700/40 bg-amber-950/30 text-amber-200 italic'
+                                                  : txt.kind === 'sfx'
+                                                    ? 'border-rose-700/40 bg-rose-950/30 font-black tracking-wider text-rose-300 uppercase'
+                                                    : 'border-slate-700 bg-slate-900 text-slate-100 hover:border-slate-500'
+                                            }`}
+                                          >
+                                            {txt.kind === 'dialogue' && (
+                                              <span className="mr-1.5 font-bold text-amber-300">
+                                                {speakerName}:
+                                              </span>
+                                            )}
+                                            <span>{txt.text}</span>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                );
+                              })}
                             </div>
                           );
                         })}
@@ -1543,7 +974,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  Click any Page, Panel, or Dialogue bubble on the canvas to target it. Only the
+                  Click any Page, Panel, or Dialogue balloon on the canvas to target it. Only the
                   selected elements are sent so you can reuse your active LLM chat window.
                 </p>
 
@@ -1601,17 +1032,6 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                   Stage & Preview JSON
                 </button>
               </div>
-
-              {lastCopiedPrompt && (
-                <div className="space-y-1">
-                  <span className="text-[11px] font-semibold uppercase text-slate-400">
-                    Last Copied Clipboard Prompt
-                  </span>
-                  <pre className="max-h-40 overflow-y-auto rounded border border-slate-800 bg-slate-950 p-2 text-[11px] text-slate-300 whitespace-pre-wrap">
-                    {lastCopiedPrompt}
-                  </pre>
-                </div>
-              )}
             </div>
           )}
 
@@ -1620,6 +1040,57 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               <h3 className="text-xs font-bold uppercase tracking-wider text-amber-400">
                 Direct Element Inspector (Auto-Saves)
               </h3>
+
+              {selectedScene && (
+                <div className="space-y-3 text-xs">
+                  <input
+                    aria-label="Scene Title"
+                    placeholder="Scene Title"
+                    value={selectedScene.title}
+                    onChange={(e) =>
+                      engine.upsertScene({ ...selectedScene, title: e.target.value })
+                    }
+                    className="w-full rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-white"
+                  />
+                  <textarea
+                    aria-label="Scene Summary"
+                    placeholder="Scene Summary"
+                    rows={2}
+                    value={selectedScene.summary}
+                    onChange={(e) =>
+                      engine.upsertScene({ ...selectedScene, summary: e.target.value })
+                    }
+                    className="w-full rounded border border-slate-700 bg-slate-900 p-2 text-white"
+                  />
+                  <input
+                    aria-label="Scene Dramatic Beat"
+                    placeholder="Dramatic Beat"
+                    value={selectedScene.dramaticBeat}
+                    onChange={(e) =>
+                      engine.upsertScene({ ...selectedScene, dramaticBeat: e.target.value })
+                    }
+                    className="w-full rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-white"
+                  />
+                  <select
+                    aria-label="Scene Location"
+                    value={selectedScene.locationId ?? ''}
+                    onChange={(e) =>
+                      engine.upsertScene({
+                        ...selectedScene,
+                        locationId: e.target.value || undefined,
+                      })
+                    }
+                    className="w-full rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-white"
+                  >
+                    <option value="">No Location Linked</option>
+                    {comic.storyBible.locations.map((l) => (
+                      <option key={l.id} value={l.id}>
+                        {l.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
               {selectedPanel && (
                 <div className="space-y-3 text-xs">
@@ -1673,26 +1144,139 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                     </div>
                   </div>
 
+                  <button
+                    type="button"
+                    onClick={() => engine.normalizePage(selectedPanel.pageId)}
+                    className="w-full rounded border border-slate-700 bg-slate-900 py-1 text-[11px] text-slate-300 hover:bg-slate-800"
+                  >
+                    Normalize Page Tiers to 12 Columns
+                  </button>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] text-slate-400">Framing</label>
+                      <select
+                        value={selectedPanel.panel.framing}
+                        onChange={(e) =>
+                          engine.updatePanel(selectedPanel.pageId, selectedPanel.panel.id, {
+                            framing: e.target.value as PanelFraming,
+                          })
+                        }
+                        className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
+                      >
+                        <option value="extreme-wide">extreme-wide</option>
+                        <option value="wide">wide</option>
+                        <option value="medium">medium</option>
+                        <option value="close-up">close-up</option>
+                        <option value="extreme-close-up">extreme-close-up</option>
+                        <option value="dutch-angle">dutch-angle</option>
+                        <option value="birds-eye">birds-eye</option>
+                        <option value="worms-eye">worms-eye</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] text-slate-400">Scene</label>
+                      <select
+                        aria-label="Panel Scene"
+                        value={selectedPanel.panel.sceneId}
+                        onChange={(e) =>
+                          engine.updatePanel(selectedPanel.pageId, selectedPanel.panel.id, {
+                            sceneId: e.target.value,
+                          })
+                        }
+                        className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
+                      >
+                        {comic.scenes.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.title}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
                   <div>
-                    <label className="block text-[11px] text-slate-400">Framing</label>
+                    <label className="block text-[11px] text-slate-400">Location</label>
                     <select
-                      value={selectedPanel.panel.framing}
+                      aria-label="Panel Location"
+                      value={selectedPanel.panel.locationId ?? ''}
                       onChange={(e) =>
                         engine.updatePanel(selectedPanel.pageId, selectedPanel.panel.id, {
-                          framing: e.target.value as PanelFraming,
+                          locationId: e.target.value || undefined,
                         })
                       }
                       className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
                     >
-                      <option value="extreme-wide">extreme-wide</option>
-                      <option value="wide">wide</option>
-                      <option value="medium">medium</option>
-                      <option value="close-up">close-up</option>
-                      <option value="extreme-close-up">extreme-close-up</option>
-                      <option value="dutch-angle">dutch-angle</option>
-                      <option value="birds-eye">birds-eye</option>
-                      <option value="worms-eye">worms-eye</option>
+                      <option value="">None</option>
+                      {comic.storyBible.locations.map((l) => (
+                        <option key={l.id} value={l.id}>
+                          {l.name}
+                        </option>
+                      ))}
                     </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-slate-400">
+                      Participating Characters
+                    </label>
+                    <div className="mt-1 flex flex-wrap gap-1.5">
+                      {comic.storyBible.characters.map((c) => {
+                        const active = selectedPanel.panel.characterIds.includes(c.id);
+                        return (
+                          <button
+                            key={c.id}
+                            type="button"
+                            onClick={() => {
+                              const nextIds = active
+                                ? selectedPanel.panel.characterIds.filter((id) => id !== c.id)
+                                : [...selectedPanel.panel.characterIds, c.id];
+                              engine.updatePanel(selectedPanel.pageId, selectedPanel.panel.id, {
+                                characterIds: nextIds,
+                              });
+                            }}
+                            className={`rounded px-2 py-0.5 text-[11px] ${
+                              active
+                                ? 'bg-amber-500 text-slate-950 font-semibold'
+                                : 'bg-slate-800 text-slate-300'
+                            }`}
+                          >
+                            {c.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-slate-400">Participating Props</label>
+                    <div className="mt-1 flex flex-wrap gap-1.5">
+                      {comic.storyBible.props.map((pr) => {
+                        const active = selectedPanel.panel.propIds.includes(pr.id);
+                        return (
+                          <button
+                            key={pr.id}
+                            type="button"
+                            onClick={() => {
+                              const nextIds = active
+                                ? selectedPanel.panel.propIds.filter((id) => id !== pr.id)
+                                : [...selectedPanel.panel.propIds, pr.id];
+                              engine.updatePanel(selectedPanel.pageId, selectedPanel.panel.id, {
+                                propIds: nextIds,
+                              });
+                            }}
+                            className={`rounded px-2 py-0.5 text-[11px] ${
+                              active
+                                ? 'bg-amber-500 text-slate-950 font-semibold'
+                                : 'bg-slate-800 text-slate-300'
+                            }`}
+                          >
+                            {pr.name}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   <div>
@@ -1709,20 +1293,65 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                     />
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() =>
-                      engine.addTextElement(selectedPanel.pageId, selectedPanel.panel.id, {
-                        kind: 'dialogue',
-                        characterId: comic.storyBible.characters[0]?.id ?? '',
-                        text: 'New dialogue line...',
-                        balloonStyle: 'speech',
-                      })
-                    }
-                    className="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1 text-xs text-amber-300"
-                  >
-                    + Add Dialogue Line
-                  </button>
+                  <div className="flex flex-wrap gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        engine.addTextElement(selectedPanel.pageId, selectedPanel.panel.id, {
+                          kind: 'dialogue',
+                          characterId: comic.storyBible.characters[0]?.id ?? '',
+                          text: 'New dialogue line...',
+                          balloonStyle: 'speech',
+                        })
+                      }
+                      className="rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-xs text-amber-300"
+                    >
+                      + Dialogue
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        engine.addTextElement(selectedPanel.pageId, selectedPanel.panel.id, {
+                          kind: 'caption',
+                          text: 'Narrative caption...',
+                        })
+                      }
+                      className="rounded border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs text-slate-200"
+                    >
+                      + Caption
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        engine.addTextElement(selectedPanel.pageId, selectedPanel.panel.id, {
+                          kind: 'sfx',
+                          text: 'KRAK-BOOM!',
+                        })
+                      }
+                      className="rounded border border-rose-500/40 bg-rose-500/10 px-2.5 py-1 text-xs text-rose-300"
+                    >
+                      + SFX
+                    </button>
+                    <label className="cursor-pointer rounded border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs text-slate-300">
+                      Attach Panel Image
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          readFileAsDataUrl(file, (dataUrl) =>
+                            engine.attachPanelImage(
+                              selectedPanel.pageId,
+                              selectedPanel.panel.id,
+                              dataUrl
+                            )
+                          );
+                        }}
+                      />
+                    </label>
+                  </div>
                 </div>
               )}
 
@@ -1745,36 +1374,64 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                     />
                   </div>
                   {selectedTextElement.element.kind === 'dialogue' && (
-                    <div>
-                      <label className="block text-[11px] text-slate-400">Balloon Style</label>
-                      <select
-                        value={selectedTextElement.element.balloonStyle}
-                        onChange={(e) =>
-                          engine.updateTextElement(
-                            selectedTextElement.pageId,
-                            selectedTextElement.panelId,
-                            selectedTextElement.element.id,
-                            {
-                              kind: 'dialogue',
-                              balloonStyle: e.target.value as DialogueBalloonStyle,
-                            }
-                          )
-                        }
-                        className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
-                      >
-                        <option value="speech">speech</option>
-                        <option value="thought">thought</option>
-                        <option value="whisper">whisper</option>
-                        <option value="shout">shout</option>
-                      </select>
-                    </div>
+                    <>
+                      <div>
+                        <label className="block text-[11px] text-slate-400">Speaker</label>
+                        <select
+                          aria-label="Dialogue Speaker"
+                          value={selectedTextElement.element.characterId}
+                          onChange={(e) =>
+                            engine.updateTextElement(
+                              selectedTextElement.pageId,
+                              selectedTextElement.panelId,
+                              selectedTextElement.element.id,
+                              {
+                                kind: 'dialogue',
+                                characterId: e.target.value,
+                              }
+                            )
+                          }
+                          className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
+                        >
+                          <option value="">Select Speaker</option>
+                          {comic.storyBible.characters.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[11px] text-slate-400">Balloon Style</label>
+                        <select
+                          value={selectedTextElement.element.balloonStyle}
+                          onChange={(e) =>
+                            engine.updateTextElement(
+                              selectedTextElement.pageId,
+                              selectedTextElement.panelId,
+                              selectedTextElement.element.id,
+                              {
+                                kind: 'dialogue',
+                                balloonStyle: e.target.value as DialogueBalloonStyle,
+                              }
+                            )
+                          }
+                          className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
+                        >
+                          <option value="speech">speech</option>
+                          <option value="thought">thought</option>
+                          <option value="whisper">whisper</option>
+                          <option value="shout">shout</option>
+                        </select>
+                      </div>
+                    </>
                   )}
                 </div>
               )}
 
-              {!selectedPanel && !selectedTextElement && !selectedPage && (
+              {!selectedScene && !selectedPanel && !selectedTextElement && !selectedPage && (
                 <p className="text-xs text-slate-400">
-                  Select a Page, Panel, or Dialogue line on the canvas to edit its fields directly.
+                  Select a Scene, Page, Panel, or Dialogue element to edit its fields directly.
                 </p>
               )}
             </div>

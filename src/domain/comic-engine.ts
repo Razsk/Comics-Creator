@@ -24,6 +24,32 @@ function createId(prefix: string): string {
   return `${prefix}-${random}`;
 }
 
+function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
+  const idx = list.findIndex((existing) => existing.id === item.id);
+  if (idx >= 0) {
+    list[idx] = item;
+  } else {
+    list.push(item);
+  }
+  return list;
+}
+
+export function groupPanelsByTier(
+  panels: Panel[],
+  panelFilterIds?: Set<string>
+): Map<number, Panel[]> {
+  const tiers = new Map<number, Panel[]>();
+  for (const panel of panels) {
+    if (panelFilterIds && panelFilterIds.size > 0 && !panelFilterIds.has(panel.id)) {
+      continue;
+    }
+    const list = tiers.get(panel.row) ?? [];
+    list.push(panel);
+    tiers.set(panel.row, list);
+  }
+  return tiers;
+}
+
 export function createDefaultComic(): Comic {
   return {
     id: createId('comic'),
@@ -127,14 +153,9 @@ function normalizePanel(raw: Partial<Panel>, fallbackSceneId: string): Panel {
 }
 
 function normalizePageTiers(page: Page, warnings: string[]): Page {
-  const rows = new Map<number, Panel[]>();
-  for (const panel of page.panels) {
-    const list = rows.get(panel.row) ?? [];
-    list.push(panel);
-    rows.set(panel.row, list);
-  }
+  const tiers = groupPanelsByTier(page.panels);
 
-  for (const [rowNum, rowPanels] of rows.entries()) {
+  for (const [rowNum, rowPanels] of tiers.entries()) {
     const sum = rowPanels.reduce((acc, p) => acc + p.colSpan, 0);
     if (sum !== 12 && rowPanels.length > 0) {
       warnings.push(
@@ -154,6 +175,7 @@ function normalizePageTiers(page: Page, warnings: string[]): Page {
     }
   }
 
+  page.panels.sort((a, b) => a.row - b.row);
   return page;
 }
 
@@ -265,17 +287,15 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
 
   function resolveSelectionItems(target: SelectionTarget): unknown[] {
     const idSet = new Set(target.selectedIds);
-    switch (target.scope) {
-      case 'pages':
-        return comic.pages.filter((p) => idSet.has(p.id));
-      case 'panels': {
+    const resolvers: Record<TargetedPatchScope, () => unknown[]> = {
+      pages: () => comic.pages.filter((p) => idSet.has(p.id)),
+      panels: () => {
         const page = comic.pages.find((p) => p.id === target.parentId);
-        if (page) {
-          return page.panels.filter((pan) => idSet.has(pan.id));
-        }
-        return comic.pages.flatMap((p) => p.panels).filter((pan) => idSet.has(pan.id));
-      }
-      case 'text-elements': {
+        return (page ? page.panels : comic.pages.flatMap((p) => p.panels)).filter((pan) =>
+          idSet.has(pan.id)
+        );
+      },
+      'text-elements': () => {
         for (const page of comic.pages) {
           const panel = page.panels.find((pan) => pan.id === target.parentId);
           if (panel) {
@@ -286,16 +306,13 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
           .flatMap((p) => p.panels)
           .flatMap((pan) => pan.textElements)
           .filter((t) => idSet.has(t.id));
-      }
-      case 'characters':
-        return comic.storyBible.characters.filter((c) => idSet.has(c.id));
-      case 'locations':
-        return comic.storyBible.locations.filter((l) => idSet.has(l.id));
-      case 'props':
-        return comic.storyBible.props.filter((pr) => idSet.has(pr.id));
-      case 'scenes':
-        return comic.scenes.filter((s) => idSet.has(s.id));
-    }
+      },
+      characters: () => comic.storyBible.characters.filter((c) => idSet.has(c.id)),
+      locations: () => comic.storyBible.locations.filter((l) => idSet.has(l.id)),
+      props: () => comic.storyBible.props.filter((pr) => idSet.has(pr.id)),
+      scenes: () => comic.scenes.filter((s) => idSet.has(s.id)),
+    };
+    return resolvers[target.scope]();
   }
 
   function compilePagesPromptBlock(
@@ -327,7 +344,7 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
     const lines: string[] = [
       '# COMIC ILLUSTRATION GENERATION PROMPT',
       targetPages.length > 1
-        ? `Render a multi-page comic spread/sequence covering Pages ${targetPages.map((p) => p.pageNumber).join(', ')}.`
+        ? `Render a multi-page comic sequence covering Pages ${targetPages.map((p) => p.pageNumber).join(', ')}.`
         : `Render Comic Page ${targetPages[0]?.pageNumber ?? 1}.`,
       '',
       '## Global Visual Style',
@@ -339,8 +356,8 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
       '',
       '## Lettering Mode',
       letteringMode === 'baked-in'
-        ? '- BAKED-IN LETTERING: Render crisp comic speech bubbles, narrative captions, and stylized SFX lettering inside each panel exactly as specified.'
-        : '- CLEAN ART ONLY: Render pure comic artwork and panel borders ONLY. Include NO speech bubbles, captions, or text inside the panels.',
+        ? '- BAKED-IN LETTERING: Render crisp comic Dialogue balloons, narrative Captions, and stylized SFX lettering inside each Panel exactly as specified.'
+        : '- CLEAN ART ONLY: Render pure comic artwork and Panel borders ONLY. Include NO speech bubbles, captions, or text inside the Panels.',
     ].filter(Boolean);
 
     if (bespokeInstruction) {
@@ -366,20 +383,11 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
 
     for (const page of targetPages) {
       lines.push('', `## Page ${page.pageNumber} Layout & Panels (${page.summary || 'Comic Page'})`);
-      const rows = new Map<number, Panel[]>();
-      for (const panel of page.panels) {
-        if (panelFilterIds && panelFilterIds.size > 0 && !panelFilterIds.has(panel.id)) {
-          continue;
-        }
-        const r = rows.get(panel.row) ?? [];
-        r.push(panel);
-        rows.set(panel.row, r);
-      }
-
-      const sortedRowNumbers = Array.from(rows.keys()).sort((a, b) => a - b);
+      const tiers = groupPanelsByTier(page.panels, panelFilterIds);
+      const sortedRowNumbers = Array.from(tiers.keys()).sort((a, b) => a - b);
       for (const rowNum of sortedRowNumbers) {
-        const rowPanels = rows.get(rowNum) ?? [];
-        lines.push(`### Tier ${rowNum} (12-Column Grid Row)`);
+        const rowPanels = tiers.get(rowNum) ?? [];
+        lines.push(`### Tier ${rowNum} (12-Column Grid)`);
         rowPanels.forEach((panel, idx) => {
           const widthPct = Math.round((panel.colSpan / 12) * 100);
           lines.push(
@@ -396,9 +404,9 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
                   `  * Dialogue (${speaker}, ${txt.balloonStyle} balloon): "${txt.text}"`
                 );
               } else if (txt.kind === 'caption') {
-                lines.push(`  * Caption Box: "${txt.text}"`);
+                lines.push(`  * Caption: "${txt.text}"`);
               } else if (txt.kind === 'sfx') {
-                lines.push(`  * SFX Lettering: "${txt.text}"`);
+                lines.push(`  * SFX: "${txt.text}"`);
               }
             }
           }
@@ -441,17 +449,8 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
     },
 
     upsertCharacter(input: UpsertCharacterInput): Character {
-      const id = input.id ?? createId('char');
-      const character: Character = {
-        ...input,
-        id,
-      };
-      const idx = comic.storyBible.characters.findIndex((c) => c.id === id);
-      if (idx >= 0) {
-        comic.storyBible.characters[idx] = character;
-      } else {
-        comic.storyBible.characters.push(character);
-      }
+      const character: Character = { ...input, id: input.id ?? createId('char') };
+      upsertById(comic.storyBible.characters, character);
       persist();
       return structuredClone(character);
     },
@@ -464,17 +463,8 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
     },
 
     upsertLocation(input: UpsertLocationInput): Location {
-      const id = input.id ?? createId('loc');
-      const location: Location = {
-        ...input,
-        id,
-      };
-      const idx = comic.storyBible.locations.findIndex((l) => l.id === id);
-      if (idx >= 0) {
-        comic.storyBible.locations[idx] = location;
-      } else {
-        comic.storyBible.locations.push(location);
-      }
+      const location: Location = { ...input, id: input.id ?? createId('loc') };
+      upsertById(comic.storyBible.locations, location);
       persist();
       return structuredClone(location);
     },
@@ -485,17 +475,8 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
     },
 
     upsertProp(input: UpsertPropInput): Prop {
-      const id = input.id ?? createId('prop');
-      const prop: Prop = {
-        ...input,
-        id,
-      };
-      const idx = comic.storyBible.props.findIndex((p) => p.id === id);
-      if (idx >= 0) {
-        comic.storyBible.props[idx] = prop;
-      } else {
-        comic.storyBible.props.push(prop);
-      }
+      const prop: Prop = { ...input, id: input.id ?? createId('prop') };
+      upsertById(comic.storyBible.props, prop);
       persist();
       return structuredClone(prop);
     },
@@ -506,16 +487,15 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
     },
 
     upsertScene(input: UpsertSceneInput): Scene {
-      const id = input.id ?? createId('scene');
-      const scene: Scene = { ...input, id };
-      const idx = comic.scenes.findIndex((s) => s.id === id);
-      if (idx >= 0) {
-        comic.scenes[idx] = scene;
-      } else {
-        comic.scenes.push(scene);
-      }
+      const scene: Scene = { ...input, id: input.id ?? createId('scene') };
+      upsertById(comic.scenes, scene);
       persist();
       return structuredClone(scene);
+    },
+
+    deleteScene(sceneId: string): void {
+      comic.scenes = comic.scenes.filter((s) => s.id !== sceneId);
+      persist();
     },
 
     addPage(summary = ''): Page {
@@ -568,7 +548,12 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
       return structuredClone(panel);
     },
 
-    updatePanel(pageId: string, panelId: string, patch: Partial<Panel>): void {
+    updatePanel(
+      pageId: string,
+      panelId: string,
+      patch: Partial<Panel>,
+      options: { normalizeTiers?: boolean } = {}
+    ): void {
       const page = comic.pages.find((p) => p.id === pageId);
       if (!page) return;
       const idx = page.panels.findIndex((p) => p.id === panelId);
@@ -578,6 +563,18 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
         ...patch,
         id: panelId,
       };
+      if (options.normalizeTiers) {
+        normalizePageTiers(page, []);
+      } else {
+        page.panels.sort((a, b) => a.row - b.row);
+      }
+      persist();
+    },
+
+    normalizePage(pageId: string): void {
+      const page = comic.pages.find((p) => p.id === pageId);
+      if (!page) return;
+      normalizePageTiers(page, []);
       persist();
     },
 
@@ -589,7 +586,11 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
       persist();
     },
 
-    addTextElement(pageId: string, panelId: string, element: Partial<PanelTextElement>): PanelTextElement | null {
+    addTextElement(
+      pageId: string,
+      panelId: string,
+      element: Partial<PanelTextElement>
+    ): PanelTextElement | null {
       const page = comic.pages.find((p) => p.id === pageId);
       const panel = page?.panels.find((pan) => pan.id === panelId);
       if (!panel) return null;
@@ -648,7 +649,7 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
     importComicJson(rawJson: string): Comic {
       const parsed = extractJsonObject(rawJson) as unknown as Comic;
       if (!parsed || typeof parsed !== 'object' || !parsed.storyBible) {
-        throw new Error('Invalid Comic JSON file.');
+        throw new Error('Invalid Comic JSON.');
       }
       comic = structuredClone(parsed);
       persist();
@@ -704,7 +705,7 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
                     facialFeaturesAndHair: '...',
                     signatureOutfitAndColors: '...',
                     distinguishingMarks: '...',
-                    visualPromptTag: 'Concise visual descriptor for image prompts',
+                    visualPromptTag: 'Concise Visual Prompt Tag for image generation',
                   },
                   personality: {
                     coreTraits: ['...'],
@@ -800,6 +801,11 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
             parentId: target.parentId,
             selectedIds: target.selectedIds,
             replacements: selectedItems,
+            proposedAssets: {
+              characters: [],
+              locations: [],
+              props: [],
+            },
           },
           null,
           2
@@ -958,30 +964,9 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
 
       const mergeProposedAssets = (proposed?: ProposedAssets) => {
         if (!proposed) return;
-        for (const char of proposed.characters) {
-          const existingIdx = comic.storyBible.characters.findIndex((c) => c.id === char.id);
-          if (existingIdx >= 0) {
-            comic.storyBible.characters[existingIdx] = char;
-          } else {
-            comic.storyBible.characters.push(char);
-          }
-        }
-        for (const loc of proposed.locations) {
-          const existingIdx = comic.storyBible.locations.findIndex((l) => l.id === loc.id);
-          if (existingIdx >= 0) {
-            comic.storyBible.locations[existingIdx] = loc;
-          } else {
-            comic.storyBible.locations.push(loc);
-          }
-        }
-        for (const prop of proposed.props) {
-          const existingIdx = comic.storyBible.props.findIndex((p) => p.id === prop.id);
-          if (existingIdx >= 0) {
-            comic.storyBible.props[existingIdx] = prop;
-          } else {
-            comic.storyBible.props.push(prop);
-          }
-        }
+        proposed.characters.forEach((char) => upsertById(comic.storyBible.characters, char));
+        proposed.locations.forEach((loc) => upsertById(comic.storyBible.locations, loc));
+        proposed.props.forEach((prop) => upsertById(comic.storyBible.props, prop));
       };
 
       if (stagedDiff.kind === 'initiation-draft') {
@@ -996,62 +981,71 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
         const { scope, parentId, selectedIds, replacements } = stagedDiff;
         const warnings: string[] = [];
 
-        if (scope === 'pages') {
-          comic.pages = spliceSelectedSlice(
-            comic.pages,
-            selectedIds,
-            replacements as Page[]
-          ).map((page, index) => ({
-            ...page,
-            pageNumber: index + 1,
-          }));
-        } else if (scope === 'panels') {
-          const page = comic.pages.find((p) => p.id === parentId) ?? comic.pages[0];
-          if (page) {
-            page.panels = spliceSelectedSlice(
-              page.panels,
+        const appliers: Record<TargetedPatchScope, () => void> = {
+          pages: () => {
+            comic.pages = spliceSelectedSlice(
+              comic.pages,
               selectedIds,
-              replacements as Panel[]
-            );
-            normalizePageTiers(page, warnings);
-          }
-        } else if (scope === 'text-elements') {
-          for (const page of comic.pages) {
-            const panel = page.panels.find((pan) => pan.id === parentId);
-            if (panel) {
-              panel.textElements = spliceSelectedSlice(
-                panel.textElements,
+              replacements as Page[]
+            ).map((page, index) => ({
+              ...page,
+              pageNumber: index + 1,
+            }));
+          },
+          panels: () => {
+            const page = comic.pages.find((p) => p.id === parentId) ?? comic.pages[0];
+            if (page) {
+              page.panels = spliceSelectedSlice(
+                page.panels,
                 selectedIds,
-                replacements as PanelTextElement[]
+                replacements as Panel[]
               );
-              break;
+              normalizePageTiers(page, warnings);
             }
-          }
-        } else if (scope === 'characters') {
-          comic.storyBible.characters = spliceSelectedSlice(
-            comic.storyBible.characters,
-            selectedIds,
-            replacements as Character[]
-          );
-        } else if (scope === 'locations') {
-          comic.storyBible.locations = spliceSelectedSlice(
-            comic.storyBible.locations,
-            selectedIds,
-            replacements as Location[]
-          );
-        } else if (scope === 'props') {
-          comic.storyBible.props = spliceSelectedSlice(
-            comic.storyBible.props,
-            selectedIds,
-            replacements as Prop[]
-          );
-        } else if (scope === 'scenes') {
-          comic.scenes = spliceSelectedSlice(
-            comic.scenes,
-            selectedIds,
-            replacements as Scene[]
-          );
-        }
+          },
+          'text-elements': () => {
+            for (const page of comic.pages) {
+              const panel = page.panels.find((pan) => pan.id === parentId);
+              if (panel) {
+                panel.textElements = spliceSelectedSlice(
+                  panel.textElements,
+                  selectedIds,
+                  replacements as PanelTextElement[]
+                );
+                break;
+              }
+            }
+          },
+          characters: () => {
+            comic.storyBible.characters = spliceSelectedSlice(
+              comic.storyBible.characters,
+              selectedIds,
+              replacements as Character[]
+            );
+          },
+          locations: () => {
+            comic.storyBible.locations = spliceSelectedSlice(
+              comic.storyBible.locations,
+              selectedIds,
+              replacements as Location[]
+            );
+          },
+          props: () => {
+            comic.storyBible.props = spliceSelectedSlice(
+              comic.storyBible.props,
+              selectedIds,
+              replacements as Prop[]
+            );
+          },
+          scenes: () => {
+            comic.scenes = spliceSelectedSlice(
+              comic.scenes,
+              selectedIds,
+              replacements as Scene[]
+            );
+          },
+        };
+        appliers[scope]();
       }
 
       stagedDiff = null;
