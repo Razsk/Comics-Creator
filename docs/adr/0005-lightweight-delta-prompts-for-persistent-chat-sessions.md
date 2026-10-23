@@ -1,0 +1,3 @@
+# Lightweight selection-only prompts for persistent LLM chat sessions
+
+Partial refinement prompts sent via the Clipboard Bridge include only the selected elements (`Pages`, `Panels`, `Dialogue`/`Caption`/`SFX`, or `Assets`), the user's bespoke instruction, and the Targeted Patch Envelope JSON schema—omitting surrounding pages and Story Bible dumps. Because creators reuse the same external LLM chat session initialized during the Initiation Phase, the LLM already holds the Manuscript, Story Bible, and full Comic draft in its conversation history; sending only the target selection avoids redundant token bloat and keeps the model focused strictly on the requested edit.
