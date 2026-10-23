@@ -1,0 +1,13 @@
+services:
+  comics-creator-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: comics-creator-web
+    restart: unless-stopped
+    ports:
+      - "8484:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
