@@ -701,6 +701,236 @@ Let me know if you want any adjustments!`;
       'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
     );
   });
+
+  it('supports manual editing of panels and speech, adjusting panel widths with sibling rebalancing, and splitting panels within a Tier', async () => {
+    const storage = createInMemoryStorageAdapter();
+    const engine = await createComicEngine({ storage });
+
+    const aria = engine.upsertCharacter({
+      name: 'Aria Vance',
+      aliases: [],
+      role: 'protagonist',
+      appearance: {
+        ageAndBuild: '20s',
+        facialFeaturesAndHair: 'Silver bob',
+        signatureOutfitAndColors: 'Ochre coat',
+        distinguishingMarks: 'Loupe',
+        visualPromptTag: 'Aria Vance',
+      },
+      personality: { coreTraits: [], voiceAndSpeechStyle: '', quirksAndMannerisms: '' },
+      motivation: { primaryGoal: '', coreFearOrConflict: '', moralAlignmentOrCode: '' },
+      background: { summary: '', relationships: [] },
+    });
+
+    const page = engine.addPage('Manual layout page');
+    const panel1 = engine.addPanel(page.id, {
+      row: 1,
+      colSpan: 12,
+      heightWeight: 'lg',
+      framing: 'wide',
+      visualDescription: 'Initial wide shot of the clocktower.',
+    })!;
+
+    // Manually resize a single panel in Tier 1 to 8 columns; adding a panel to Tier 2 must not clobber Tier 1's manual width
+    engine.resizePanel(page.id, panel1.id, 8);
+    expect(engine.getComic().pages[0].panels[0].colSpan).toBe(8);
+
+    const panel2 = engine.addPanel(page.id, {
+      row: 2,
+      colSpan: 12,
+      visualDescription: 'Tier 2 action shot.',
+    })!;
+    expect(engine.getComic().pages[0].panels[0].colSpan).toBe(8);
+
+    // Split panel2 in Tier 2 into two side-by-side panels (6 + 6)
+    const panel2b = engine.splitPanel(page.id, panel2.id)!;
+    const tier2Panels = engine
+      .getComic()
+      .pages[0].panels.filter((p) => p.row === 2);
+    expect(tier2Panels).toHaveLength(2);
+    expect(tier2Panels.map((p) => p.colSpan)).toEqual([6, 6]);
+
+    // Resize first panel in Tier 2 from 6 to 9 -> sibling automatically rebalances to 3 (sum = 12)
+    engine.resizePanel(page.id, panel2.id, 9);
+    const resizedTier2 = engine
+      .getComic()
+      .pages[0].panels.filter((p) => p.row === 2);
+    expect(resizedTier2.map((p) => p.colSpan)).toEqual([9, 3]);
+
+    // Manually add, edit, reorder, and delete speech elements (Dialogue, Caption, SFX)
+    const dlg1 = engine.addTextElement(page.id, panel2.id, {
+      kind: 'dialogue',
+      characterId: aria.id,
+      speakerName: 'Aria (Radio)',
+      text: 'First line of speech.',
+      balloonStyle: 'whisper',
+    })!;
+    const cap1 = engine.addTextElement(page.id, panel2.id, {
+      kind: 'caption',
+      text: 'Meanwhile, above the clouds...',
+    })!;
+    const sfx1 = engine.addTextElement(page.id, panel2b.id, {
+      kind: 'sfx',
+      text: 'CLANG!',
+      visualStyle: 'jagged metallic letters',
+    })!;
+
+    engine.updateTextElement(page.id, panel2.id, dlg1.id, {
+      kind: 'dialogue',
+      characterId: aria.id,
+      speakerName: 'Aria Vance',
+      text: 'Updated manual speech line!',
+      balloonStyle: 'shout',
+    });
+
+    // Move caption above dialogue
+    engine.moveTextElement(page.id, panel2.id, cap1.id, 'up');
+
+    const updatedPanel2 = engine
+      .getComic()
+      .pages[0].panels.find((p) => p.id === panel2.id)!;
+    expect(updatedPanel2.textElements.map((t) => t.id)).toEqual([cap1.id, dlg1.id]);
+    expect(updatedPanel2.textElements[1]).toMatchObject({
+      id: dlg1.id,
+      kind: 'dialogue',
+      speakerName: 'Aria Vance',
+      text: 'Updated manual speech line!',
+      balloonStyle: 'shout',
+    });
+
+    // Delete SFX from panel2b
+    engine.deleteTextElement(page.id, panel2b.id, sfx1.id);
+    const updatedPanel2b = engine
+      .getComic()
+      .pages[0].panels.find((p) => p.id === panel2b.id)!;
+    expect(updatedPanel2b.textElements).toHaveLength(0);
+  });
+
+  it('searches and replaces both plain strings and regular expressions across panels, speech, Story Bible, and manuscript with scope filtering', async () => {
+    const storage = createInMemoryStorageAdapter();
+    const engine = await createComicEngine({ storage });
+
+    engine.updateComicMeta({ title: 'Sector 7 Chronicles', synopsis: 'Aria defends Sector 7.' });
+    engine.updateManuscript('In Sector 7, Aria Vance guards the Chrono-Core v1.2.');
+
+    const aria = engine.upsertCharacter({
+      name: 'Aria Vance',
+      aliases: ['Agent 07'],
+      role: 'protagonist',
+      appearance: {
+        ageAndBuild: 'Late 20s',
+        facialFeaturesAndHair: 'Silver bob',
+        signatureOutfitAndColors: 'Sector 7 patrol trenchcoat',
+        distinguishingMarks: '',
+        visualPromptTag: 'Aria Vance in Sector 7 trenchcoat',
+      },
+      personality: { coreTraits: [], voiceAndSpeechStyle: '', quirksAndMannerisms: '' },
+      motivation: { primaryGoal: '', coreFearOrConflict: '', moralAlignmentOrCode: '' },
+      background: { summary: 'Born in Sector 7.', relationships: [] },
+    });
+
+    const page = engine.addPage('Battle in Sector 7');
+    const panel = engine.addPanel(page.id, {
+      row: 1,
+      colSpan: 12,
+      visualDescription: 'Aria runs across Sector 7 bridge holding Chrono-Core v1.2.',
+    })!;
+    engine.addTextElement(page.id, panel.id, {
+      kind: 'dialogue',
+      characterId: aria.id,
+      text: 'Sector 7 is collapsing! Activate Chrono-Core v1.2 and Chrono-Core v2.4!',
+      balloonStyle: 'shout',
+    });
+    engine.addTextElement(page.id, panel.id, {
+      kind: 'caption',
+      text: 'Sector 7 — 03:00 HRS.',
+    });
+
+    // 1. Plain string search across 'all' scopes (case-insensitive by default)
+    const allSearch = engine.searchComic({
+      query: 'sector 7',
+      useRegex: false,
+      caseSensitive: false,
+      scope: 'all',
+      replacement: 'District 9',
+    });
+    expect(allSearch.error).toBeUndefined();
+    expect(allSearch.totalMatches).toBe(10);
+    expect(allSearch.items.some((i) => i.previewAfter?.includes('District 9'))).toBe(true);
+
+    // 2. Scoped plain string replacement ONLY in 'speech' (Dialogue, Caption, SFX)
+    const speechReplace = engine.replaceInComic({
+      query: 'Sector 7',
+      replacement: 'District 9',
+      useRegex: false,
+      caseSensitive: true,
+      scope: 'speech',
+    });
+    expect(speechReplace.replacedCount).toBe(2);
+    expect(speechReplace.affectedFields).toBe(2);
+
+    const comicAfterSpeechReplace = engine.getComic();
+    // Speech elements updated
+    expect(comicAfterSpeechReplace.pages[0].panels[0].textElements[0].text).toBe(
+      'District 9 is collapsing! Activate Chrono-Core v1.2 and Chrono-Core v2.4!'
+    );
+    expect(comicAfterSpeechReplace.pages[0].panels[0].textElements[1].text).toBe(
+      'District 9 — 03:00 HRS.'
+    );
+    // Panel visualDescription and Story Bible untouched because scope was 'speech'
+    expect(comicAfterSpeechReplace.pages[0].panels[0].visualDescription).toContain('Sector 7');
+    expect(comicAfterSpeechReplace.storyBible.characters[0].background.summary).toBe(
+      'Born in Sector 7.'
+    );
+
+    // 3. Regex search and replace with capture groups across 'all' scopes
+    // Replace "Chrono-Core v<major>.<minor>" with "Aether-Engine Mk-$1"
+    const regexSearch = engine.searchComic({
+      query: 'Chrono-Core v(\\d+)\\.(\\d+)',
+      useRegex: true,
+      caseSensitive: false,
+      scope: 'all',
+      replacement: 'Aether-Engine Mk-$1',
+    });
+    expect(regexSearch.totalMatches).toBe(4); // 1 in manuscript, 1 in panel visualDescription, 2 in dialogue
+
+    const regexReplace = engine.replaceInComic({
+      query: 'Chrono-Core v(\\d+)\\.(\\d+)',
+      replacement: 'Aether-Engine Mk-$1',
+      useRegex: true,
+      caseSensitive: false,
+      scope: 'all',
+    });
+    expect(regexReplace.replacedCount).toBe(4);
+
+    const comicAfterRegex = engine.getComic();
+    expect(comicAfterRegex.manuscript).toBe(
+      'In Sector 7, Aria Vance guards the Aether-Engine Mk-1.'
+    );
+    expect(comicAfterRegex.pages[0].panels[0].visualDescription).toBe(
+      'Aria runs across Sector 7 bridge holding Aether-Engine Mk-1.'
+    );
+    expect(comicAfterRegex.pages[0].panels[0].textElements[0].text).toBe(
+      'District 9 is collapsing! Activate Aether-Engine Mk-1 and Aether-Engine Mk-2!'
+    );
+
+    // 4. Invalid regex returns a safe error instead of throwing
+    const badRegex = engine.searchComic({
+      query: '[unclosed group',
+      useRegex: true,
+    });
+    expect(badRegex.totalMatches).toBe(0);
+    expect(badRegex.error).toBeDefined();
+
+    // 5. Resetting the Comic clears all content, staged diffs, and persists a fresh default Comic
+    const resetState = engine.resetComic();
+    expect(resetState.title).toBe('Untitled Comic');
+    expect(resetState.manuscript).toBe('');
+    expect(resetState.pages).toHaveLength(0);
+    expect(resetState.scenes).toHaveLength(0);
+    expect(resetState.storyBible.characters).toHaveLength(0);
+    expect((await storage.load())?.title).toBe('Untitled Comic');
+  });
 });
 
 

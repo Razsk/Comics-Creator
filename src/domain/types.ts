@@ -237,5 +237,58 @@ export interface CompiledImagePrompt {
   prompt: string;
 }
 
+export type SearchReplaceScope =
+  | 'all'
+  | 'panels-and-speech'
+  | 'speech'
+  | 'panels'
+  | 'story-bible'
+  | 'scenes'
+  | 'manuscript';
+
+export interface SearchQueryOptions {
+  query: string;
+  useRegex?: boolean;
+  caseSensitive?: boolean;
+  scope?: SearchReplaceScope;
+  replacement?: string;
+}
+
+export interface SearchMatchItem {
+  id: string;
+  scope: 'speech' | 'panels' | 'story-bible' | 'scenes' | 'manuscript';
+  locationLabel: string;
+  fieldLabel: string;
+  pageId?: string;
+  panelId?: string;
+  textElementId?: string;
+  sourceText: string;
+  matchCount: number;
+  matches: string[];
+  previewAfter?: string;
+}
+
+export interface SearchResult {
+  totalMatches: number;
+  items: SearchMatchItem[];
+  error?: string;
+}
+
+export interface ReplaceQueryOptions {
+  query: string;
+  replacement: string;
+  useRegex?: boolean;
+  caseSensitive?: boolean;
+  scope?: SearchReplaceScope;
+  targetItemIds?: string[];
+}
+
+export interface ReplaceResult {
+  replacedCount: number;
+  affectedFields: number;
+  error?: string;
+}
+
+
 
 

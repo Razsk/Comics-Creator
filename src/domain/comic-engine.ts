@@ -12,7 +12,13 @@ import {
   PanelTextElement,
   Prop,
   ProposedAssets,
+  ReplaceQueryOptions,
+  ReplaceResult,
   Scene,
+  SearchMatchItem,
+  SearchQueryOptions,
+  SearchReplaceScope,
+  SearchResult,
   SelectionTarget,
   StagedDiff,
   TargetedPatchScope,
@@ -426,6 +432,13 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
       return stagedDiff ? structuredClone(stagedDiff) : null;
     },
 
+    resetComic(): Comic {
+      comic = createDefaultComic();
+      stagedDiff = null;
+      persist();
+      return this.getComic();
+    },
+
     updateComicMeta(patch: { title?: string; synopsis?: string }): Comic {
       if (patch.title !== undefined) comic.title = patch.title;
       if (patch.synopsis !== undefined) comic.synopsis = patch.synopsis;
@@ -531,10 +544,12 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
       const page = comic.pages.find((p) => p.id === pageId);
       if (!page) return null;
       const maxRow = page.panels.reduce((max, p) => Math.max(max, p.row), 0);
+      const targetRow = partial.row ?? maxRow + 1;
+      const existingInRow = page.panels.filter((p) => p.row === targetRow);
       const panel = normalizePanel(
         {
-          row: partial.row ?? maxRow + 1,
-          colSpan: partial.colSpan ?? 12,
+          row: targetRow,
+          colSpan: partial.colSpan ?? (existingInRow.length > 0 ? Math.max(1, Math.floor(12 / (existingInRow.length + 1))) : 12),
           heightWeight: partial.heightWeight ?? 'md',
           framing: partial.framing ?? 'medium',
           visualDescription: partial.visualDescription ?? 'New panel action...',
@@ -543,26 +558,186 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
         comic.scenes[0]?.id ?? 'scene-1'
       );
       page.panels.push(panel);
-      normalizePageTiers(page, []);
+      if (existingInRow.length > 0) {
+        const rowPanels = page.panels.filter((p) => p.row === targetRow);
+        const sum = rowPanels.reduce((acc, p) => acc + p.colSpan, 0);
+        if (sum > 12 || partial.colSpan === undefined) {
+          let remaining = 12;
+          rowPanels.forEach((p, idx) => {
+            if (idx === rowPanels.length - 1) {
+              p.colSpan = Math.max(1, remaining);
+            } else {
+              const scaled = Math.max(1, Math.round((p.colSpan / sum) * 12));
+              const maxAllowed = Math.max(1, remaining - (rowPanels.length - 1 - idx));
+              p.colSpan = Math.min(scaled, maxAllowed);
+              remaining -= p.colSpan;
+            }
+          });
+        }
+      }
+      page.panels.sort((a, b) => a.row - b.row);
       persist();
       return structuredClone(panel);
+    },
+
+    splitPanel(pageId: string, panelId: string): Panel | null {
+      const page = comic.pages.find((p) => p.id === pageId);
+      if (!page) return null;
+      const idx = page.panels.findIndex((p) => p.id === panelId);
+      if (idx === -1) return null;
+      const source = page.panels[idx];
+      const rowPanels = page.panels.filter((p) => p.row === source.row);
+      if (rowPanels.length >= 12) return null;
+
+      let newSpan = 6;
+      if (source.colSpan >= 2) {
+        newSpan = Math.floor(source.colSpan / 2);
+        source.colSpan = source.colSpan - newSpan;
+      } else {
+        newSpan = 1;
+      }
+
+      const sibling = normalizePanel(
+        {
+          sceneId: source.sceneId,
+          row: source.row,
+          colSpan: newSpan,
+          heightWeight: source.heightWeight,
+          framing: source.framing,
+          visualDescription: 'New panel action...',
+          locationId: source.locationId,
+          characterIds: [...source.characterIds],
+          propIds: [...source.propIds],
+          textElements: [],
+        },
+        source.sceneId
+      );
+
+      page.panels.splice(idx + 1, 0, sibling);
+
+      const updatedRowPanels = page.panels.filter((p) => p.row === source.row);
+      const sum = updatedRowPanels.reduce((acc, p) => acc + p.colSpan, 0);
+      if (sum > 12) {
+        let remaining = 12;
+        updatedRowPanels.forEach((p, i) => {
+          if (i === updatedRowPanels.length - 1) {
+            p.colSpan = Math.max(1, remaining);
+          } else {
+            const scaled = Math.max(1, Math.round((p.colSpan / sum) * 12));
+            const maxAllowed = Math.max(1, remaining - (updatedRowPanels.length - 1 - i));
+            p.colSpan = Math.min(scaled, maxAllowed);
+            remaining -= p.colSpan;
+          }
+        });
+      }
+
+      page.panels.sort((a, b) => a.row - b.row);
+      persist();
+      return structuredClone(sibling);
+    },
+
+    resizePanel(
+      pageId: string,
+      panelId: string,
+      colSpan: number,
+      options: { rebalanceTier?: boolean } = {}
+    ): void {
+      const page = comic.pages.find((p) => p.id === pageId);
+      if (!page) return;
+      const target = page.panels.find((p) => p.id === panelId);
+      if (!target) return;
+
+      const rowPanels = page.panels.filter((p) => p.row === target.row);
+      const siblings = rowPanels.filter((p) => p.id !== panelId);
+      const shouldRebalance = options.rebalanceTier ?? siblings.length > 0;
+
+      if (!shouldRebalance || siblings.length === 0) {
+        target.colSpan = Math.min(12, Math.max(1, Math.round(colSpan)));
+        persist();
+        return;
+      }
+
+      const maxTargetSpan = Math.max(1, 12 - siblings.length);
+      const clampedTargetSpan = Math.min(maxTargetSpan, Math.max(1, Math.round(colSpan)));
+      target.colSpan = clampedTargetSpan;
+
+      let remaining = 12 - clampedTargetSpan;
+      const currentSiblingSum = siblings.reduce((acc, s) => acc + s.colSpan, 0);
+
+      siblings.forEach((sib, idx) => {
+        if (idx === siblings.length - 1) {
+          sib.colSpan = Math.max(1, remaining);
+        } else {
+          const ratio = currentSiblingSum > 0 ? sib.colSpan / currentSiblingSum : 1 / siblings.length;
+          const scaled = Math.max(1, Math.round(ratio * (12 - clampedTargetSpan)));
+          const maxAllowed = Math.max(1, remaining - (siblings.length - 1 - idx));
+          sib.colSpan = Math.min(scaled, maxAllowed);
+          remaining -= sib.colSpan;
+        }
+      });
+
+      persist();
+    },
+
+    movePanel(
+      pageId: string,
+      panelId: string,
+      direction: 'left' | 'right' | 'up' | 'down'
+    ): void {
+      const page = comic.pages.find((p) => p.id === pageId);
+      if (!page) return;
+      const idx = page.panels.findIndex((p) => p.id === panelId);
+      if (idx === -1) return;
+      const panel = page.panels[idx];
+
+      if (direction === 'up') {
+        panel.row = Math.max(1, panel.row - 1);
+        page.panels.sort((a, b) => a.row - b.row);
+      } else if (direction === 'down') {
+        panel.row = panel.row + 1;
+        page.panels.sort((a, b) => a.row - b.row);
+      } else if (direction === 'left' && idx > 0 && page.panels[idx - 1].row === panel.row) {
+        const temp = page.panels[idx - 1];
+        page.panels[idx - 1] = panel;
+        page.panels[idx] = temp;
+      } else if (
+        direction === 'right' &&
+        idx < page.panels.length - 1 &&
+        page.panels[idx + 1].row === panel.row
+      ) {
+        const temp = page.panels[idx + 1];
+        page.panels[idx + 1] = panel;
+        page.panels[idx] = temp;
+      }
+      persist();
     },
 
     updatePanel(
       pageId: string,
       panelId: string,
       patch: Partial<Panel>,
-      options: { normalizeTiers?: boolean } = {}
+      options: { normalizeTiers?: boolean; rebalanceTier?: boolean } = {}
     ): void {
       const page = comic.pages.find((p) => p.id === pageId);
       if (!page) return;
       const idx = page.panels.findIndex((p) => p.id === panelId);
       if (idx === -1) return;
+      const sanitizedPatch = { ...patch };
+      if (typeof sanitizedPatch.colSpan === 'number') {
+        sanitizedPatch.colSpan = Math.min(12, Math.max(1, Math.round(sanitizedPatch.colSpan)));
+      }
+      if (typeof sanitizedPatch.row === 'number') {
+        sanitizedPatch.row = Math.max(1, Math.round(sanitizedPatch.row));
+      }
       page.panels[idx] = {
         ...page.panels[idx],
-        ...patch,
+        ...sanitizedPatch,
         id: panelId,
       };
+      if (options.rebalanceTier && typeof sanitizedPatch.colSpan === 'number') {
+        this.resizePanel(pageId, panelId, sanitizedPatch.colSpan, { rebalanceTier: true });
+        return;
+      }
       if (options.normalizeTiers) {
         normalizePageTiers(page, []);
       } else {
@@ -582,7 +757,7 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
       const page = comic.pages.find((p) => p.id === pageId);
       if (!page) return;
       page.panels = page.panels.filter((p) => p.id !== panelId);
-      normalizePageTiers(page, []);
+      page.panels.sort((a, b) => a.row - b.row);
       persist();
     },
 
@@ -617,6 +792,30 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
         id: elementId,
       });
       persist();
+    },
+
+    moveTextElement(
+      pageId: string,
+      panelId: string,
+      elementId: string,
+      direction: 'up' | 'down'
+    ): void {
+      const page = comic.pages.find((p) => p.id === pageId);
+      const panel = page?.panels.find((pan) => pan.id === panelId);
+      if (!panel) return;
+      const idx = panel.textElements.findIndex((t) => t.id === elementId);
+      if (idx === -1) return;
+      if (direction === 'up' && idx > 0) {
+        const temp = panel.textElements[idx - 1];
+        panel.textElements[idx - 1] = panel.textElements[idx];
+        panel.textElements[idx] = temp;
+        persist();
+      } else if (direction === 'down' && idx < panel.textElements.length - 1) {
+        const temp = panel.textElements[idx + 1];
+        panel.textElements[idx + 1] = panel.textElements[idx];
+        panel.textElements[idx] = temp;
+        persist();
+      }
     },
 
     deleteTextElement(pageId: string, panelId: string, elementId: string): void {
@@ -1056,7 +1255,592 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
     discardStagedDiff(): void {
       stagedDiff = null;
     },
+
+    searchComic(searchOpts: SearchQueryOptions): SearchResult {
+      const query = searchOpts.query ?? '';
+      if (!query) {
+        return { totalMatches: 0, items: [] };
+      }
+
+      const flags = searchOpts.caseSensitive ? 'g' : 'gi';
+      let regex: RegExp;
+      try {
+        const pattern = searchOpts.useRegex
+          ? query
+          : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        regex = new RegExp(pattern, flags);
+      } catch (err) {
+        return {
+          totalMatches: 0,
+          items: [],
+          error: err instanceof Error ? err.message : 'Invalid regular expression',
+        };
+      }
+
+      const scopeFilter: SearchReplaceScope = searchOpts.scope ?? 'all';
+      const descriptors = collectSearchableFields(comic, scopeFilter);
+      const items: SearchMatchItem[] = [];
+      let totalMatches = 0;
+
+      for (const desc of descriptors) {
+        const sourceText = desc.get();
+        if (!sourceText) continue;
+        regex.lastIndex = 0;
+        const matches: string[] = [];
+        let match: RegExpExecArray | null;
+        while ((match = regex.exec(sourceText)) !== null) {
+          matches.push(match[0]);
+          if (match[0].length === 0) {
+            regex.lastIndex++;
+          }
+        }
+        if (matches.length > 0) {
+          totalMatches += matches.length;
+          let previewAfter: string | undefined;
+          if (searchOpts.replacement !== undefined) {
+            regex.lastIndex = 0;
+            previewAfter = searchOpts.useRegex
+              ? sourceText.replace(regex, searchOpts.replacement)
+              : sourceText.replace(regex, () => searchOpts.replacement!);
+          }
+          items.push({
+            id: desc.id,
+            scope: desc.scope,
+            locationLabel: desc.locationLabel,
+            fieldLabel: desc.fieldLabel,
+            pageId: desc.pageId,
+            panelId: desc.panelId,
+            textElementId: desc.textElementId,
+            sourceText,
+            matchCount: matches.length,
+            matches,
+            previewAfter,
+          });
+        }
+      }
+
+      return { totalMatches, items };
+    },
+
+    replaceInComic(replaceOpts: ReplaceQueryOptions): ReplaceResult {
+      const query = replaceOpts.query ?? '';
+      if (!query) {
+        return { replacedCount: 0, affectedFields: 0 };
+      }
+
+      const flags = replaceOpts.caseSensitive ? 'g' : 'gi';
+      let regex: RegExp;
+      try {
+        const pattern = replaceOpts.useRegex
+          ? query
+          : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        regex = new RegExp(pattern, flags);
+      } catch (err) {
+        return {
+          replacedCount: 0,
+          affectedFields: 0,
+          error: err instanceof Error ? err.message : 'Invalid regular expression',
+        };
+      }
+
+      const scopeFilter: SearchReplaceScope = replaceOpts.scope ?? 'all';
+      const targetSet =
+        replaceOpts.targetItemIds && replaceOpts.targetItemIds.length > 0
+          ? new Set(replaceOpts.targetItemIds)
+          : null;
+      const descriptors = collectSearchableFields(comic, scopeFilter);
+
+      let replacedCount = 0;
+      let affectedFields = 0;
+
+      for (const desc of descriptors) {
+        if (targetSet && !targetSet.has(desc.id)) continue;
+        const sourceText = desc.get();
+        if (!sourceText) continue;
+        regex.lastIndex = 0;
+        let fieldMatches = 0;
+        let match: RegExpExecArray | null;
+        while ((match = regex.exec(sourceText)) !== null) {
+          fieldMatches++;
+          if (match[0].length === 0) {
+            regex.lastIndex++;
+          }
+        }
+        if (fieldMatches > 0) {
+          regex.lastIndex = 0;
+          const updated = replaceOpts.useRegex
+            ? sourceText.replace(regex, replaceOpts.replacement)
+            : sourceText.replace(regex, () => replaceOpts.replacement);
+          desc.set(updated);
+          replacedCount += fieldMatches;
+          affectedFields++;
+        }
+      }
+
+      if (affectedFields > 0) {
+        persist();
+      }
+
+      return { replacedCount, affectedFields };
+    },
   };
+}
+
+interface SearchableFieldDescriptor {
+  id: string;
+  scope: 'speech' | 'panels' | 'story-bible' | 'scenes' | 'manuscript';
+  locationLabel: string;
+  fieldLabel: string;
+  pageId?: string;
+  panelId?: string;
+  textElementId?: string;
+  get(): string;
+  set(val: string): void;
+}
+
+function collectSearchableFields(
+  comic: Comic,
+  scopeFilter: SearchReplaceScope
+): SearchableFieldDescriptor[] {
+  const fields: SearchableFieldDescriptor[] = [];
+
+  const includeSpeech =
+    scopeFilter === 'all' || scopeFilter === 'panels-and-speech' || scopeFilter === 'speech';
+  const includePanels =
+    scopeFilter === 'all' || scopeFilter === 'panels-and-speech' || scopeFilter === 'panels';
+  const includeStoryBible = scopeFilter === 'all' || scopeFilter === 'story-bible';
+  const includeScenes = scopeFilter === 'all' || scopeFilter === 'scenes';
+  const includeManuscript = scopeFilter === 'all' || scopeFilter === 'manuscript';
+
+  if (includePanels || includeSpeech) {
+    comic.pages.forEach((page) => {
+      if (includePanels) {
+        fields.push({
+          id: `page:${page.id}:summary`,
+          scope: 'panels',
+          locationLabel: `Page ${page.pageNumber}`,
+          fieldLabel: 'Page Summary',
+          pageId: page.id,
+          get: () => page.summary ?? '',
+          set: (v) => {
+            page.summary = v;
+          },
+        });
+      }
+
+      page.panels.forEach((panel, panelIdx) => {
+        const panelNum = panelIdx + 1;
+        if (includePanels) {
+          fields.push({
+            id: `page:${page.id}:panel:${panel.id}:visualDescription`,
+            scope: 'panels',
+            locationLabel: `Page ${page.pageNumber} · Panel ${panelNum}`,
+            fieldLabel: 'Visual Description',
+            pageId: page.id,
+            panelId: panel.id,
+            get: () => panel.visualDescription,
+            set: (v) => {
+              panel.visualDescription = v;
+            },
+          });
+        }
+
+        if (includeSpeech) {
+          panel.textElements.forEach((txt, txtIdx) => {
+            const speaker =
+              txt.kind === 'dialogue'
+                ? comic.storyBible.characters.find((c) => c.id === txt.characterId)?.name ||
+                  txt.speakerName ||
+                  'Dialogue'
+                : txt.kind === 'caption'
+                  ? 'Caption'
+                  : 'SFX';
+            fields.push({
+              id: `page:${page.id}:panel:${panel.id}:text:${txt.id}:text`,
+              scope: 'speech',
+              locationLabel: `Page ${page.pageNumber} · Panel ${panelNum} · ${speaker} #${txtIdx + 1}`,
+              fieldLabel: `${txt.kind.toUpperCase()} Text`,
+              pageId: page.id,
+              panelId: panel.id,
+              textElementId: txt.id,
+              get: () => txt.text,
+              set: (v) => {
+                txt.text = v;
+              },
+            });
+            if (txt.kind === 'dialogue' && txt.speakerName !== undefined) {
+              fields.push({
+                id: `page:${page.id}:panel:${panel.id}:text:${txt.id}:speakerName`,
+                scope: 'speech',
+                locationLabel: `Page ${page.pageNumber} · Panel ${panelNum} · Dialogue #${txtIdx + 1}`,
+                fieldLabel: 'Speaker Name',
+                pageId: page.id,
+                panelId: panel.id,
+                textElementId: txt.id,
+                get: () => txt.speakerName ?? '',
+                set: (v) => {
+                  txt.speakerName = v;
+                },
+              });
+            }
+            if (txt.kind === 'sfx' && txt.visualStyle !== undefined) {
+              fields.push({
+                id: `page:${page.id}:panel:${panel.id}:text:${txt.id}:visualStyle`,
+                scope: 'speech',
+                locationLabel: `Page ${page.pageNumber} · Panel ${panelNum} · SFX #${txtIdx + 1}`,
+                fieldLabel: 'SFX Visual Style',
+                pageId: page.id,
+                panelId: panel.id,
+                textElementId: txt.id,
+                get: () => txt.visualStyle ?? '',
+                set: (v) => {
+                  txt.visualStyle = v;
+                },
+              });
+            }
+          });
+        }
+      });
+    });
+  }
+
+  if (includeStoryBible) {
+    const vs = comic.storyBible.visualStyle;
+    const vsKeys: Array<[keyof VisualStyle, string]> = [
+      ['artTradition', 'Art Tradition'],
+      ['lineAndInking', 'Line & Inking'],
+      ['colorPaletteAndShading', 'Color Palette & Shading'],
+      ['eraAndTone', 'Era & Tone'],
+      ['negativePrompt', 'Negative Prompt'],
+    ];
+    for (const [key, label] of vsKeys) {
+      fields.push({
+        id: `bible:visualStyle:${key}`,
+        scope: 'story-bible',
+        locationLabel: 'Story Bible · Visual Style',
+        fieldLabel: label,
+        get: () => vs[key],
+        set: (v) => {
+          vs[key] = v;
+        },
+      });
+    }
+
+    comic.storyBible.characters.forEach((c) => {
+      const locLabel = `Character: ${c.name}`;
+      fields.push(
+        {
+          id: `bible:char:${c.id}:name`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Name',
+          get: () => c.name,
+          set: (v) => {
+            c.name = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:visualPromptTag`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Visual Prompt Tag',
+          get: () => c.appearance.visualPromptTag,
+          set: (v) => {
+            c.appearance.visualPromptTag = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:ageAndBuild`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Age & Build',
+          get: () => c.appearance.ageAndBuild,
+          set: (v) => {
+            c.appearance.ageAndBuild = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:facialFeaturesAndHair`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Facial Features & Hair',
+          get: () => c.appearance.facialFeaturesAndHair,
+          set: (v) => {
+            c.appearance.facialFeaturesAndHair = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:signatureOutfitAndColors`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Signature Outfit & Colors',
+          get: () => c.appearance.signatureOutfitAndColors,
+          set: (v) => {
+            c.appearance.signatureOutfitAndColors = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:distinguishingMarks`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Distinguishing Marks',
+          get: () => c.appearance.distinguishingMarks,
+          set: (v) => {
+            c.appearance.distinguishingMarks = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:voiceAndSpeechStyle`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Voice & Speech Style',
+          get: () => c.personality.voiceAndSpeechStyle,
+          set: (v) => {
+            c.personality.voiceAndSpeechStyle = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:quirksAndMannerisms`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Quirks & Mannerisms',
+          get: () => c.personality.quirksAndMannerisms,
+          set: (v) => {
+            c.personality.quirksAndMannerisms = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:primaryGoal`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Primary Goal',
+          get: () => c.motivation.primaryGoal,
+          set: (v) => {
+            c.motivation.primaryGoal = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:coreFearOrConflict`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Core Fear or Conflict',
+          get: () => c.motivation.coreFearOrConflict,
+          set: (v) => {
+            c.motivation.coreFearOrConflict = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:moralAlignmentOrCode`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Moral Alignment or Code',
+          get: () => c.motivation.moralAlignmentOrCode,
+          set: (v) => {
+            c.motivation.moralAlignmentOrCode = v;
+          },
+        },
+        {
+          id: `bible:char:${c.id}:backgroundSummary`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Background Summary',
+          get: () => c.background.summary,
+          set: (v) => {
+            c.background.summary = v;
+          },
+        }
+      );
+      c.aliases.forEach((_, idx) => {
+        fields.push({
+          id: `bible:char:${c.id}:alias:${idx}`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: `Alias #${idx + 1}`,
+          get: () => c.aliases[idx] ?? '',
+          set: (v) => {
+            c.aliases[idx] = v;
+          },
+        });
+      });
+    });
+
+    comic.storyBible.locations.forEach((l) => {
+      const locLabel = `Location: ${l.name}`;
+      fields.push(
+        {
+          id: `bible:loc:${l.id}:name`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Name',
+          get: () => l.name,
+          set: (v) => {
+            l.name = v;
+          },
+        },
+        {
+          id: `bible:loc:${l.id}:visualPromptTag`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Visual Prompt Tag',
+          get: () => l.visualPromptTag,
+          set: (v) => {
+            l.visualPromptTag = v;
+          },
+        },
+        {
+          id: `bible:loc:${l.id}:architectureAndScale`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Architecture & Scale',
+          get: () => l.architectureAndScale,
+          set: (v) => {
+            l.architectureAndScale = v;
+          },
+        },
+        {
+          id: `bible:loc:${l.id}:lightingAndAtmosphere`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Lighting & Atmosphere',
+          get: () => l.lightingAndAtmosphere,
+          set: (v) => {
+            l.lightingAndAtmosphere = v;
+          },
+        },
+        {
+          id: `bible:loc:${l.id}:loreAndContext`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Lore & Context',
+          get: () => l.loreAndContext,
+          set: (v) => {
+            l.loreAndContext = v;
+          },
+        }
+      );
+    });
+
+    comic.storyBible.props.forEach((pr) => {
+      const locLabel = `Prop: ${pr.name}`;
+      fields.push(
+        {
+          id: `bible:prop:${pr.id}:name`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Name',
+          get: () => pr.name,
+          set: (v) => {
+            pr.name = v;
+          },
+        },
+        {
+          id: `bible:prop:${pr.id}:visualPromptTag`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Visual Prompt Tag',
+          get: () => pr.visualPromptTag,
+          set: (v) => {
+            pr.visualPromptTag = v;
+          },
+        },
+        {
+          id: `bible:prop:${pr.id}:visualDescription`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Visual Description',
+          get: () => pr.visualDescription,
+          set: (v) => {
+            pr.visualDescription = v;
+          },
+        },
+        {
+          id: `bible:prop:${pr.id}:narrativePurpose`,
+          scope: 'story-bible',
+          locationLabel: locLabel,
+          fieldLabel: 'Narrative Purpose',
+          get: () => pr.narrativePurpose,
+          set: (v) => {
+            pr.narrativePurpose = v;
+          },
+        }
+      );
+    });
+  }
+
+  if (includeScenes) {
+    comic.scenes.forEach((s) => {
+      const locLabel = `Scene: ${s.title}`;
+      fields.push(
+        {
+          id: `scene:${s.id}:title`,
+          scope: 'scenes',
+          locationLabel: locLabel,
+          fieldLabel: 'Title',
+          get: () => s.title,
+          set: (v) => {
+            s.title = v;
+          },
+        },
+        {
+          id: `scene:${s.id}:summary`,
+          scope: 'scenes',
+          locationLabel: locLabel,
+          fieldLabel: 'Summary',
+          get: () => s.summary,
+          set: (v) => {
+            s.summary = v;
+          },
+        },
+        {
+          id: `scene:${s.id}:dramaticBeat`,
+          scope: 'scenes',
+          locationLabel: locLabel,
+          fieldLabel: 'Dramatic Beat',
+          get: () => s.dramaticBeat,
+          set: (v) => {
+            s.dramaticBeat = v;
+          },
+        }
+      );
+    });
+  }
+
+  if (includeManuscript) {
+    fields.push(
+      {
+        id: 'comic:title',
+        scope: 'manuscript',
+        locationLabel: 'Comic Metadata',
+        fieldLabel: 'Title',
+        get: () => comic.title,
+        set: (v) => {
+          comic.title = v;
+        },
+      },
+      {
+        id: 'comic:synopsis',
+        scope: 'manuscript',
+        locationLabel: 'Comic Metadata',
+        fieldLabel: 'Synopsis',
+        get: () => comic.synopsis,
+        set: (v) => {
+          comic.synopsis = v;
+        },
+      },
+      {
+        id: 'comic:manuscript',
+        scope: 'manuscript',
+        locationLabel: 'Manuscript',
+        fieldLabel: 'Source Text',
+        get: () => comic.manuscript,
+        set: (v) => {
+          comic.manuscript = v;
+        },
+      }
+    );
+  }
+
+  return fields;
 }
 
 export type ComicEngine = Awaited<ReturnType<typeof createComicEngine>>;

@@ -13,6 +13,7 @@ import {
   PanelHeightWeight,
   PanelTextElement,
   Prop,
+  SearchReplaceScope,
   SelectionTarget,
   StagedDiff,
 } from '@/domain/types';
@@ -33,7 +34,7 @@ export interface ComicStudioProps {
 }
 
 type WorkspaceMode = 'initiation' | 'story-bible' | 'canvas';
-type RightDockTab = 'refine' | 'inspector' | 'image-prompts';
+type RightDockTab = 'refine' | 'inspector' | 'search-replace' | 'image-prompts';
 
 const HEIGHT_CLASS_MAP: Record<PanelHeightWeight, string> = {
   sm: 'min-h-[130px]',
@@ -77,6 +78,15 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
   const [deliveryMode, setDeliveryMode] = useState<ImagePromptDeliveryMode>('composite-spread');
   const [letteringMode, setLetteringMode] = useState<LetteringMode>('baked-in');
   const [imageBespokeInstruction, setImageBespokeInstruction] = useState<string>('');
+
+  const [manualEditAll, setManualEditAll] = useState<boolean>(false);
+  const [editingPanelIds, setEditingPanelIds] = useState<string[]>([]);
+
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [replaceText, setReplaceText] = useState<string>('');
+  const [useRegex, setUseRegex] = useState<boolean>(false);
+  const [caseSensitive, setCaseSensitive] = useState<boolean>(false);
+  const [searchScope, setSearchScope] = useState<SearchReplaceScope>('all');
 
   useEffect(() => {
     let mounted = true;
@@ -170,6 +180,23 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
     letteringMode,
     imageBespokeInstruction,
   ]);
+
+  const searchResult = useMemo(() => {
+    if (!engine || !comic) return { totalMatches: 0, items: [] };
+    return engine.searchComic({
+      query: searchQuery,
+      useRegex,
+      caseSensitive,
+      scope: searchScope,
+      replacement: replaceText,
+    });
+  }, [engine, comic, searchQuery, replaceText, useRegex, caseSensitive, searchScope]);
+
+  const togglePanelInlineEdit = (panelId: string) => {
+    setEditingPanelIds((prev) =>
+      prev.includes(panelId) ? prev.filter((id) => id !== panelId) : [...prev, panelId]
+    );
+  };
 
   if (!engine || !comic) {
     return (
@@ -271,6 +298,22 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
     setStagedDiff(null);
   };
 
+  const handleNewComic = () => {
+    engine.resetComic();
+    setStagedDiff(null);
+    setActiveCharacterId(null);
+    setActiveLocationId(null);
+    setActivePropId(null);
+    setSelection({ scope: 'pages', selectedIds: [] });
+    setSelectionInstruction('');
+    setRawLlmInput('');
+    setImportError(null);
+    setSelectedImagePageIds([]);
+    setEditingPanelIds([]);
+    setManualEditAll(false);
+    setStatusToast('New Comic created.');
+  };
+
   const handleSelectElement = (
     nextScope: SelectionTarget['scope'],
     id: string,
@@ -365,6 +408,13 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               {statusToast}
             </span>
           )}
+          <button
+            type="button"
+            onClick={handleNewComic}
+            className="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-300 hover:bg-amber-500/20"
+          >
+            New Comic
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -671,7 +721,35 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
           )}
 
           {mode === 'canvas' && (
-            <div className="space-y-8">
+            <div className="space-y-6">
+              {/* Canvas Toolbar */}
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-900/80 px-4 py-2.5">
+                <div className="flex items-center gap-2 text-xs text-slate-300">
+                  <span className="font-semibold text-white">Comic Canvas</span>
+                  <span className="text-slate-500">·</span>
+                  <span>
+                    {comic.pages.length} Page(s) ·{' '}
+                    {comic.pages.reduce((acc, p) => acc + p.panels.length, 0)} Panel(s)
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    aria-label="Edit All Panels & Speech"
+                    onClick={() => setManualEditAll((prev) => !prev)}
+                    className={`rounded border px-3 py-1 text-xs font-semibold transition ${
+                      manualEditAll
+                        ? 'border-amber-400 bg-amber-500 text-slate-950'
+                        : 'border-slate-700 bg-slate-800 text-amber-300 hover:bg-slate-700'
+                    }`}
+                  >
+                    {manualEditAll
+                      ? '✓ Editing All Panels & Speech'
+                      : 'Edit All Panels & Speech'}
+                  </button>
+                </div>
+              </div>
+
               {comic.pages.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-slate-800 p-12 text-center">
                   <p className="text-sm text-slate-300">
@@ -747,6 +825,14 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                           >
                             + Add Panel
                           </button>
+                          <button
+                            type="button"
+                            aria-label={`Delete Page ${page.pageNumber}`}
+                            onClick={() => engine.deletePage(page.id)}
+                            className="rounded border border-rose-800/60 bg-rose-950/40 px-2 py-1 text-xs text-rose-300 hover:bg-rose-900/50"
+                          >
+                            Delete Page
+                          </button>
                         </div>
                       </div>
 
@@ -767,9 +853,15 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                           return (
                             <div key={rowNum} className="grid grid-cols-12 gap-3">
                               {rowPanels.map((panel) => {
+                                const panelIndexOnPage = page.panels.findIndex(
+                                  (p) => p.id === panel.id
+                                );
+                                const panelNum = panelIndexOnPage + 1;
                                 const isPanelSelected =
                                   selection.scope === 'panels' &&
                                   selection.selectedIds.includes(panel.id);
+                                const isInlineEditing =
+                                  manualEditAll || editingPanelIds.includes(panel.id);
                                 const scene = comic.scenes.find((s) => s.id === panel.sceneId);
                                 const panelLocation = comic.storyBible.locations.find(
                                   (l) => l.id === panel.locationId
@@ -803,11 +895,76 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                                     }`}
                                   >
                                     <div className="space-y-2">
-                                      <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
-                                        <span className="font-bold text-amber-300">
-                                          Tier {panel.row} ({panel.colSpan}/12 · {panel.heightWeight})
-                                        </span>
-                                        <div className="flex items-center gap-1">
+                                      <div className="flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
+                                        <div className="flex flex-wrap items-center gap-1.5">
+                                          <span className="font-bold text-amber-300">
+                                            Tier {panel.row} ({panel.colSpan}/12 · {panel.heightWeight})
+                                          </span>
+
+                                          {/* Direct Panel Width Adjuster */}
+                                          <div
+                                            className="flex items-center gap-0.5 rounded border border-slate-700 bg-slate-900 px-1 py-0.5"
+                                            onClick={(e) => e.stopPropagation()}
+                                          >
+                                            <button
+                                              type="button"
+                                              aria-label={`Decrease Panel ${panelNum} Width`}
+                                              title="Decrease Panel Width"
+                                              onClick={() =>
+                                                engine.resizePanel(
+                                                  page.id,
+                                                  panel.id,
+                                                  panel.colSpan - 1
+                                                )
+                                              }
+                                              className="px-1 font-bold text-slate-300 hover:text-amber-300"
+                                            >
+                                              −
+                                            </button>
+                                            <select
+                                              aria-label={`Panel ${panelNum} Width`}
+                                              value={panel.colSpan}
+                                              onChange={(e) =>
+                                                engine.resizePanel(
+                                                  page.id,
+                                                  panel.id,
+                                                  Number(e.target.value)
+                                                )
+                                              }
+                                              className="bg-transparent text-[10px] font-semibold text-amber-200 focus:outline-none"
+                                            >
+                                              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((w) => (
+                                                <option
+                                                  key={w}
+                                                  value={w}
+                                                  className="bg-slate-900 text-white"
+                                                >
+                                                  {w}/12
+                                                </option>
+                                              ))}
+                                            </select>
+                                            <button
+                                              type="button"
+                                              aria-label={`Increase Panel ${panelNum} Width`}
+                                              title="Increase Panel Width"
+                                              onClick={() =>
+                                                engine.resizePanel(
+                                                  page.id,
+                                                  panel.id,
+                                                  panel.colSpan + 1
+                                                )
+                                              }
+                                              className="px-1 font-bold text-slate-300 hover:text-amber-300"
+                                            >
+                                              +
+                                            </button>
+                                          </div>
+                                        </div>
+
+                                        <div
+                                          className="flex flex-wrap items-center gap-1"
+                                          onClick={(e) => e.stopPropagation()}
+                                        >
                                           <span className="rounded bg-slate-800 px-1.5 py-0.5 text-slate-300">
                                             {panel.framing}
                                           </span>
@@ -816,6 +973,35 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                                               {scene.title}
                                             </span>
                                           )}
+                                          <button
+                                            type="button"
+                                            aria-label={`Split Panel ${panelNum}`}
+                                            title="Split Panel in Tier"
+                                            onClick={() => engine.splitPanel(page.id, panel.id)}
+                                            className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-amber-300 hover:bg-slate-800"
+                                          >
+                                            + Split
+                                          </button>
+                                          <button
+                                            type="button"
+                                            aria-label={`Edit Panel ${panelNum}`}
+                                            onClick={() => togglePanelInlineEdit(panel.id)}
+                                            className={`rounded border px-1.5 py-0.5 text-[10px] ${
+                                              isInlineEditing
+                                                ? 'border-amber-400 bg-amber-500 text-slate-950 font-semibold'
+                                                : 'border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800'
+                                            }`}
+                                          >
+                                            {isInlineEditing ? 'Done' : 'Edit'}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            aria-label={`Delete Panel ${panelNum}`}
+                                            onClick={() => engine.deletePanel(page.id, panel.id)}
+                                            className="rounded border border-rose-800/50 bg-rose-950/40 px-1.5 py-0.5 text-[10px] text-rose-300 hover:bg-rose-900/50"
+                                          >
+                                            ×
+                                          </button>
                                         </div>
                                       </div>
 
@@ -856,14 +1042,106 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                                         />
                                       )}
 
-                                      <p className="text-xs leading-relaxed text-slate-200">
-                                        {panel.visualDescription}
-                                      </p>
+                                      {isInlineEditing ? (
+                                        <div
+                                          className="space-y-2 rounded border border-slate-800 bg-slate-900/80 p-2 text-xs"
+                                          onClick={(e) => e.stopPropagation()}
+                                        >
+                                          <div className="grid grid-cols-3 gap-1.5">
+                                            <div>
+                                              <label className="block text-[10px] text-slate-400">
+                                                Tier (Row)
+                                              </label>
+                                              <input
+                                                aria-label={`Page ${page.pageNumber} Panel ${panelNum} Tier`}
+                                                type="number"
+                                                min={1}
+                                                value={panel.row}
+                                                onChange={(e) =>
+                                                  engine.updatePanel(page.id, panel.id, {
+                                                    row: Number(e.target.value) || 1,
+                                                  })
+                                                }
+                                                className="w-full rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-[11px] text-white"
+                                              />
+                                            </div>
+                                            <div>
+                                              <label className="block text-[10px] text-slate-400">
+                                                Height
+                                              </label>
+                                              <select
+                                                aria-label={`Page ${page.pageNumber} Panel ${panelNum} Height`}
+                                                value={panel.heightWeight}
+                                                onChange={(e) =>
+                                                  engine.updatePanel(page.id, panel.id, {
+                                                    heightWeight:
+                                                      e.target.value as PanelHeightWeight,
+                                                  })
+                                                }
+                                                className="w-full rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-[11px] text-white"
+                                              >
+                                                <option value="sm">sm</option>
+                                                <option value="md">md</option>
+                                                <option value="lg">lg</option>
+                                                <option value="xl">xl</option>
+                                                <option value="splash">splash</option>
+                                              </select>
+                                            </div>
+                                            <div>
+                                              <label className="block text-[10px] text-slate-400">
+                                                Framing
+                                              </label>
+                                              <select
+                                                aria-label={`Page ${page.pageNumber} Panel ${panelNum} Framing`}
+                                                value={panel.framing}
+                                                onChange={(e) =>
+                                                  engine.updatePanel(page.id, panel.id, {
+                                                    framing: e.target.value as PanelFraming,
+                                                  })
+                                                }
+                                                className="w-full rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-[11px] text-white"
+                                              >
+                                                <option value="extreme-wide">extreme-wide</option>
+                                                <option value="wide">wide</option>
+                                                <option value="medium">medium</option>
+                                                <option value="close-up">close-up</option>
+                                                <option value="extreme-close-up">
+                                                  extreme-close-up
+                                                </option>
+                                                <option value="dutch-angle">dutch-angle</option>
+                                                <option value="birds-eye">birds-eye</option>
+                                                <option value="worms-eye">worms-eye</option>
+                                              </select>
+                                            </div>
+                                          </div>
+                                          <div>
+                                            <label className="block text-[10px] text-slate-400">
+                                              Visual Description
+                                            </label>
+                                            <textarea
+                                              aria-label={`Page ${page.pageNumber} Panel ${panelNum} Visual Description`}
+                                              rows={2}
+                                              value={panel.visualDescription}
+                                              onChange={(e) =>
+                                                engine.updatePanel(page.id, panel.id, {
+                                                  visualDescription: e.target.value,
+                                                })
+                                              }
+                                              className="mt-0.5 w-full rounded border border-slate-700 bg-slate-950 p-1.5 text-xs text-white"
+                                            />
+                                          </div>
+                                        </div>
+                                      ) : (
+                                        <p className="text-xs leading-relaxed text-slate-200">
+                                          {panel.visualDescription}
+                                        </p>
+                                      )}
                                     </div>
 
                                     {/* Panel Text Elements (Dialogue, Captions, SFX) */}
                                     <div className="mt-3 space-y-1.5">
-                                      {panel.textElements.map((txt) => {
+                                      {panel.textElements.map((txt, txtIdx) => {
+                                        const speechNum = txtIdx + 1;
                                         const isTxtSelected =
                                           selection.scope === 'text-elements' &&
                                           selection.selectedIds.includes(txt.id);
@@ -875,6 +1153,168 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                                               txt.speakerName ||
                                               'Speaker'
                                             : null;
+
+                                        if (isInlineEditing) {
+                                          return (
+                                            <div
+                                              key={txt.id}
+                                              onClick={(e) => e.stopPropagation()}
+                                              className="space-y-1.5 rounded-md border border-slate-700 bg-slate-900 p-2 text-xs"
+                                            >
+                                              <div className="flex flex-wrap items-center justify-between gap-1">
+                                                <select
+                                                  aria-label={`Page ${page.pageNumber} Panel ${panelNum} Speech ${speechNum} Kind`}
+                                                  value={txt.kind}
+                                                  onChange={(e) =>
+                                                    engine.updateTextElement(
+                                                      page.id,
+                                                      panel.id,
+                                                      txt.id,
+                                                      {
+                                                        kind: e.target
+                                                          .value as PanelTextElement['kind'],
+                                                      }
+                                                    )
+                                                  }
+                                                  className="rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-[11px] font-semibold text-amber-300"
+                                                >
+                                                  <option value="dialogue">Dialogue</option>
+                                                  <option value="caption">Caption</option>
+                                                  <option value="sfx">SFX</option>
+                                                </select>
+
+                                                {txt.kind === 'dialogue' && (
+                                                  <>
+                                                    <select
+                                                      aria-label={`Page ${page.pageNumber} Panel ${panelNum} Speech ${speechNum} Speaker`}
+                                                      value={txt.characterId}
+                                                      onChange={(e) =>
+                                                        engine.updateTextElement(
+                                                          page.id,
+                                                          panel.id,
+                                                          txt.id,
+                                                          {
+                                                            kind: 'dialogue',
+                                                            characterId: e.target.value,
+                                                          }
+                                                        )
+                                                      }
+                                                      className="rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-[11px] text-white"
+                                                    >
+                                                      <option value="">Custom Speaker</option>
+                                                      {comic.storyBible.characters.map((c) => (
+                                                        <option key={c.id} value={c.id}>
+                                                          {c.name}
+                                                        </option>
+                                                      ))}
+                                                    </select>
+                                                    <input
+                                                      aria-label={`Page ${page.pageNumber} Panel ${panelNum} Speech ${speechNum} Speaker Name`}
+                                                      placeholder="Speaker name..."
+                                                      value={txt.speakerName ?? ''}
+                                                      onChange={(e) =>
+                                                        engine.updateTextElement(
+                                                          page.id,
+                                                          panel.id,
+                                                          txt.id,
+                                                          {
+                                                            kind: 'dialogue',
+                                                            speakerName: e.target.value,
+                                                          }
+                                                        )
+                                                      }
+                                                      className="w-28 rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-[11px] text-white"
+                                                    />
+                                                    <select
+                                                      aria-label={`Page ${page.pageNumber} Panel ${panelNum} Speech ${speechNum} Balloon Style`}
+                                                      value={txt.balloonStyle}
+                                                      onChange={(e) =>
+                                                        engine.updateTextElement(
+                                                          page.id,
+                                                          panel.id,
+                                                          txt.id,
+                                                          {
+                                                            kind: 'dialogue',
+                                                            balloonStyle: e.target
+                                                              .value as DialogueBalloonStyle,
+                                                          }
+                                                        )
+                                                      }
+                                                      className="rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-[11px] text-slate-200"
+                                                    >
+                                                      <option value="speech">speech</option>
+                                                      <option value="thought">thought</option>
+                                                      <option value="whisper">whisper</option>
+                                                      <option value="shout">shout</option>
+                                                    </select>
+                                                  </>
+                                                )}
+
+                                                <div className="flex items-center gap-1">
+                                                  <button
+                                                    type="button"
+                                                    aria-label={`Move Speech ${speechNum} Up`}
+                                                    onClick={() =>
+                                                      engine.moveTextElement(
+                                                        page.id,
+                                                        panel.id,
+                                                        txt.id,
+                                                        'up'
+                                                      )
+                                                    }
+                                                    className="rounded border border-slate-700 bg-slate-950 px-1 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+                                                  >
+                                                    ↑
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    aria-label={`Move Speech ${speechNum} Down`}
+                                                    onClick={() =>
+                                                      engine.moveTextElement(
+                                                        page.id,
+                                                        panel.id,
+                                                        txt.id,
+                                                        'down'
+                                                      )
+                                                    }
+                                                    className="rounded border border-slate-700 bg-slate-950 px-1 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+                                                  >
+                                                    ↓
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    aria-label={`Delete Page ${page.pageNumber} Panel ${panelNum} Speech ${speechNum}`}
+                                                    onClick={() =>
+                                                      engine.deleteTextElement(
+                                                        page.id,
+                                                        panel.id,
+                                                        txt.id
+                                                      )
+                                                    }
+                                                    className="rounded border border-rose-800/50 bg-rose-950/40 px-1.5 py-0.5 text-[10px] text-rose-300 hover:bg-rose-900/50"
+                                                  >
+                                                    ×
+                                                  </button>
+                                                </div>
+                                              </div>
+
+                                              <input
+                                                aria-label={`Page ${page.pageNumber} Panel ${panelNum} Speech ${speechNum} Text`}
+                                                value={txt.text}
+                                                onChange={(e) =>
+                                                  engine.updateTextElement(
+                                                    page.id,
+                                                    panel.id,
+                                                    txt.id,
+                                                    { text: e.target.value }
+                                                  )
+                                                }
+                                                placeholder="Enter speech, caption, or SFX text..."
+                                                className="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-white"
+                                              />
+                                            </div>
+                                          );
+                                        }
 
                                         return (
                                           <div
@@ -907,6 +1347,64 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                                           </div>
                                         );
                                       })}
+
+                                      {/* Quick Add Speech Controls on Every Panel */}
+                                      <div
+                                        className="flex flex-wrap gap-1 pt-1"
+                                        onClick={(e) => e.stopPropagation()}
+                                      >
+                                        <button
+                                          type="button"
+                                          aria-label={`Add Dialogue to Panel ${panelNum}`}
+                                          onClick={() => {
+                                            engine.addTextElement(page.id, panel.id, {
+                                              kind: 'dialogue',
+                                              characterId:
+                                                comic.storyBible.characters[0]?.id ?? '',
+                                              text: 'New dialogue line...',
+                                              balloonStyle: 'speech',
+                                            });
+                                            if (!manualEditAll && !editingPanelIds.includes(panel.id)) {
+                                              setEditingPanelIds((prev) => [...prev, panel.id]);
+                                            }
+                                          }}
+                                          className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-300 hover:bg-amber-500/20"
+                                        >
+                                          + Dialogue
+                                        </button>
+                                        <button
+                                          type="button"
+                                          aria-label={`Add Caption to Panel ${panelNum}`}
+                                          onClick={() => {
+                                            engine.addTextElement(page.id, panel.id, {
+                                              kind: 'caption',
+                                              text: 'Narrative caption...',
+                                            });
+                                            if (!manualEditAll && !editingPanelIds.includes(panel.id)) {
+                                              setEditingPanelIds((prev) => [...prev, panel.id]);
+                                            }
+                                          }}
+                                          className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+                                        >
+                                          + Caption
+                                        </button>
+                                        <button
+                                          type="button"
+                                          aria-label={`Add SFX to Panel ${panelNum}`}
+                                          onClick={() => {
+                                            engine.addTextElement(page.id, panel.id, {
+                                              kind: 'sfx',
+                                              text: 'KRAK-BOOM!',
+                                            });
+                                            if (!manualEditAll && !editingPanelIds.includes(panel.id)) {
+                                              setEditingPanelIds((prev) => [...prev, panel.id]);
+                                            }
+                                          }}
+                                          className="rounded border border-rose-500/30 bg-rose-500/10 px-1.5 py-0.5 text-[10px] text-rose-300 hover:bg-rose-500/20"
+                                        >
+                                          + SFX
+                                        </button>
+                                      </div>
                                     </div>
                                   </div>
                                 );
@@ -923,13 +1421,13 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
           )}
         </main>
 
-        {/* Right Dock: LLM Clipboard Bridge, Direct Inspector, and Image Prompt Studio */}
+        {/* Right Dock: LLM Clipboard Bridge, Direct Inspector, Search & Replace, and Image Prompt Studio */}
         <aside className="col-span-4 flex flex-col border-l border-slate-800 bg-slate-900/70 p-4 overflow-y-auto">
-          <div className="mb-4 flex gap-1 rounded-lg bg-slate-950 p-1">
+          <div className="mb-4 flex flex-wrap gap-1 rounded-lg bg-slate-950 p-1">
             <button
               type="button"
               onClick={() => setRightTab('refine')}
-              className={`flex-1 rounded py-1.5 text-xs font-semibold ${
+              className={`flex-1 rounded py-1.5 px-2 text-xs font-semibold ${
                 rightTab === 'refine'
                   ? 'bg-amber-500 text-slate-950'
                   : 'text-slate-300 hover:text-white'
@@ -940,7 +1438,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
             <button
               type="button"
               onClick={() => setRightTab('inspector')}
-              className={`flex-1 rounded py-1.5 text-xs font-semibold ${
+              className={`flex-1 rounded py-1.5 px-2 text-xs font-semibold ${
                 rightTab === 'inspector'
                   ? 'bg-amber-500 text-slate-950'
                   : 'text-slate-300 hover:text-white'
@@ -950,8 +1448,19 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
             </button>
             <button
               type="button"
+              onClick={() => setRightTab('search-replace')}
+              className={`flex-1 rounded py-1.5 px-2 text-xs font-semibold ${
+                rightTab === 'search-replace'
+                  ? 'bg-amber-500 text-slate-950'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              Search & Replace
+            </button>
+            <button
+              type="button"
               onClick={() => setRightTab('image-prompts')}
-              className={`flex-1 rounded py-1.5 text-xs font-semibold ${
+              className={`flex-1 rounded py-1.5 px-2 text-xs font-semibold ${
                 rightTab === 'image-prompts'
                   ? 'bg-amber-500 text-slate-950'
                   : 'text-slate-300 hover:text-white'
@@ -1112,14 +1621,17 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                     <div>
                       <label className="block text-[11px] text-slate-400">ColSpan (1-12)</label>
                       <input
+                        aria-label="Selected Panel Width"
                         type="number"
                         min={1}
                         max={12}
                         value={selectedPanel.panel.colSpan}
                         onChange={(e) =>
-                          engine.updatePanel(selectedPanel.pageId, selectedPanel.panel.id, {
-                            colSpan: Number(e.target.value) || 12,
-                          })
+                          engine.resizePanel(
+                            selectedPanel.pageId,
+                            selectedPanel.panel.id,
+                            Number(e.target.value) || 12
+                          )
                         }
                         className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
                       />
@@ -1358,8 +1870,29 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               {selectedTextElement && (
                 <div className="space-y-3 text-xs">
                   <div>
+                    <label className="block text-[11px] text-slate-400">Element Kind</label>
+                    <select
+                      aria-label="Speech Element Kind"
+                      value={selectedTextElement.element.kind}
+                      onChange={(e) =>
+                        engine.updateTextElement(
+                          selectedTextElement.pageId,
+                          selectedTextElement.panelId,
+                          selectedTextElement.element.id,
+                          { kind: e.target.value as PanelTextElement['kind'] }
+                        )
+                      }
+                      className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
+                    >
+                      <option value="dialogue">Dialogue</option>
+                      <option value="caption">Caption</option>
+                      <option value="sfx">SFX</option>
+                    </select>
+                  </div>
+                  <div>
                     <label className="block text-[11px] text-slate-400">Text Content</label>
                     <textarea
+                      aria-label="Speech Text Content"
                       rows={3}
                       value={selectedTextElement.element.text}
                       onChange={(e) =>
@@ -1402,8 +1935,31 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                         </select>
                       </div>
                       <div>
+                        <label className="block text-[11px] text-slate-400">
+                          Custom Speaker Name
+                        </label>
+                        <input
+                          aria-label="Dialogue Custom Speaker Name"
+                          placeholder="Optional custom speaker label..."
+                          value={selectedTextElement.element.speakerName ?? ''}
+                          onChange={(e) =>
+                            engine.updateTextElement(
+                              selectedTextElement.pageId,
+                              selectedTextElement.panelId,
+                              selectedTextElement.element.id,
+                              {
+                                kind: 'dialogue',
+                                speakerName: e.target.value,
+                              }
+                            )
+                          }
+                          className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1 text-white"
+                        />
+                      </div>
+                      <div>
                         <label className="block text-[11px] text-slate-400">Balloon Style</label>
                         <select
+                          aria-label="Dialogue Balloon Style"
                           value={selectedTextElement.element.balloonStyle}
                           onChange={(e) =>
                             engine.updateTextElement(
@@ -1426,13 +1982,194 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                       </div>
                     </>
                   )}
+                  <button
+                    type="button"
+                    aria-label="Delete Selected Speech Element"
+                    onClick={() =>
+                      engine.deleteTextElement(
+                        selectedTextElement.pageId,
+                        selectedTextElement.panelId,
+                        selectedTextElement.element.id
+                      )
+                    }
+                    className="w-full rounded border border-rose-800/60 bg-rose-950/40 py-1.5 text-xs font-semibold text-rose-300 hover:bg-rose-900/50"
+                  >
+                    Delete Speech Element
+                  </button>
                 </div>
               )}
 
               {!selectedScene && !selectedPanel && !selectedTextElement && !selectedPage && (
                 <p className="text-xs text-slate-400">
-                  Select a Scene, Page, Panel, or Dialogue element to edit its fields directly.
+                  Select a Scene, Page, Panel, or Dialogue element to edit its fields directly, or
+                  click &ldquo;Edit All Panels &amp; Speech&rdquo; on the canvas.
                 </p>
+              )}
+            </div>
+          )}
+
+          {rightTab === 'search-replace' && (
+            <div className="space-y-4 rounded-lg border border-slate-800 bg-slate-950/70 p-4 text-xs">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-amber-400">
+                  Search &amp; Replace (String / Regex)
+                </h3>
+                <span className="text-[11px] text-slate-400">
+                  {searchResult.totalMatches} match(es)
+                </span>
+              </div>
+
+              <div className="space-y-2.5">
+                <div>
+                  <label htmlFor="search-query-input" className="block text-[11px] text-slate-300">
+                    Search Query
+                  </label>
+                  <input
+                    id="search-query-input"
+                    aria-label="Search Query"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder={
+                      useRegex
+                        ? 'Regex pattern (e.g. Chrono-Core v(\\d+))...'
+                        : 'Search text...'
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 font-mono text-xs text-white focus:border-amber-400 focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="replace-with-input" className="block text-[11px] text-slate-300">
+                    Replace With
+                  </label>
+                  <input
+                    id="replace-with-input"
+                    aria-label="Replace With"
+                    value={replaceText}
+                    onChange={(e) => setReplaceText(e.target.value)}
+                    placeholder={
+                      useRegex
+                        ? 'Replacement (supports $1, $2 capture groups)...'
+                        : 'Replacement text...'
+                    }
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 font-mono text-xs text-white focus:border-amber-400 focus:outline-none"
+                  />
+                </div>
+
+                <div className="flex flex-wrap items-center gap-4 pt-1">
+                  <label className="flex cursor-pointer items-center gap-1.5 text-slate-300">
+                    <input
+                      type="checkbox"
+                      aria-label="Use Regex"
+                      checked={useRegex}
+                      onChange={(e) => setUseRegex(e.target.checked)}
+                      className="rounded border-slate-700 bg-slate-900 text-amber-500"
+                    />
+                    <span>Use Regex (.*)</span>
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-1.5 text-slate-300">
+                    <input
+                      type="checkbox"
+                      aria-label="Case Sensitive"
+                      checked={caseSensitive}
+                      onChange={(e) => setCaseSensitive(e.target.checked)}
+                      className="rounded border-slate-700 bg-slate-900 text-amber-500"
+                    />
+                    <span>Case Sensitive (Aa)</span>
+                  </label>
+                </div>
+
+                <div>
+                  <label htmlFor="search-scope-select" className="block text-[11px] text-slate-300">
+                    Search Scope
+                  </label>
+                  <select
+                    id="search-scope-select"
+                    aria-label="Search Scope"
+                    value={searchScope}
+                    onChange={(e) => setSearchScope(e.target.value as SearchReplaceScope)}
+                    className="mt-1 w-full rounded border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-white"
+                  >
+                    <option value="all">All Comic Fields</option>
+                    <option value="panels-and-speech">Panels &amp; Speech Only</option>
+                    <option value="speech">Speech (Dialogue, Captions, SFX) Only</option>
+                    <option value="panels">Panel Visual Descriptions Only</option>
+                    <option value="story-bible">Story Bible Only</option>
+                    <option value="scenes">Scenes Only</option>
+                    <option value="manuscript">Manuscript &amp; Metadata Only</option>
+                  </select>
+                </div>
+
+                {searchResult.error && (
+                  <p className="rounded border border-rose-800/60 bg-rose-950/50 p-2 text-xs text-rose-300">
+                    Invalid Regex: {searchResult.error}
+                  </p>
+                )}
+
+                <button
+                  type="button"
+                  aria-label="Replace All Matches"
+                  disabled={!searchQuery || searchResult.totalMatches === 0 || !!searchResult.error}
+                  onClick={() => {
+                    const res = engine.replaceInComic({
+                      query: searchQuery,
+                      replacement: replaceText,
+                      useRegex,
+                      caseSensitive,
+                      scope: searchScope,
+                    });
+                    setStatusToast(
+                      `Replaced ${res.replacedCount} occurrence(s) across ${res.affectedFields} field(s).`
+                    );
+                  }}
+                  className="w-full rounded bg-amber-500 px-3 py-2 text-xs font-bold text-slate-950 hover:bg-amber-400 disabled:opacity-40"
+                >
+                  Replace All Matches ({searchResult.totalMatches})
+                </button>
+              </div>
+
+              {/* Match Results Preview List */}
+              {searchResult.items.length > 0 && (
+                <div className="max-h-96 space-y-2 overflow-y-auto pt-2">
+                  {searchResult.items.map((item) => (
+                    <div
+                      key={item.id}
+                      className="space-y-1.5 rounded border border-slate-800 bg-slate-900/90 p-2.5"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-amber-300">
+                          {item.locationLabel} · {item.fieldLabel}
+                        </span>
+                        <button
+                          type="button"
+                          aria-label={`Replace in ${item.locationLabel} ${item.fieldLabel}`}
+                          onClick={() => {
+                            const res = engine.replaceInComic({
+                              query: searchQuery,
+                              replacement: replaceText,
+                              useRegex,
+                              caseSensitive,
+                              scope: searchScope,
+                              targetItemIds: [item.id],
+                            });
+                            setStatusToast(`Replaced ${res.replacedCount} match(es).`);
+                          }}
+                          className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-300 hover:bg-amber-500/20"
+                        >
+                          Replace ({item.matchCount})
+                        </button>
+                      </div>
+                      <div className="rounded bg-slate-950 p-1.5 font-mono text-[11px] text-slate-300">
+                        {item.sourceText}
+                      </div>
+                      {item.previewAfter !== undefined && item.previewAfter !== item.sourceText && (
+                        <div className="rounded border border-emerald-800/40 bg-emerald-950/30 p-1.5 font-mono text-[11px] text-emerald-300">
+                          → {item.previewAfter}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
           )}
