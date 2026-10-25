@@ -10,6 +10,24 @@ export function readFileAsDataUrl(file: File, onLoad: (dataUrl: string) => void)
   reader.readAsDataURL(file);
 }
 
+export function readFilesAsDataUrls(
+  files: FileList | File[],
+  onLoad: (items: Array<{ dataUrl: string; name: string }>) => void
+): void {
+  const fileArray = Array.from(files);
+  if (fileArray.length === 0) return;
+  void Promise.all(
+    fileArray.map(
+      (file) =>
+        new Promise<{ dataUrl: string; name: string }>((resolve) => {
+          readFileAsDataUrl(file, (dataUrl) => {
+            resolve({ dataUrl, name: file.name });
+          });
+        })
+    )
+  ).then(onLoad);
+}
+
 export function extractClipboardImageAsDataUrl(
   clipboardData: DataTransfer | null,
   onLoad: (dataUrl: string) => void

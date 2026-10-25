@@ -289,6 +289,14 @@ export interface ReplaceResult {
   error?: string;
 }
 
+export type PageImageUploadMode = 'fill-empty' | 'append';
+
+export interface UploadedPageImageInput {
+  dataUrl: string;
+  name?: string;
+}
+
+
 
 
 

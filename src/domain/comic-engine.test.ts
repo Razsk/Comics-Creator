@@ -664,6 +664,18 @@ Let me know if you want any adjustments!`;
 
     expect(compositePrompts).toHaveLength(1);
     expect(compositePrompts[0].title).toContain('Pages 1–2');
+    expect(compositePrompts[0].prompt).toContain(
+      'generate 2 separate, individual images — one standalone image for each requested Page'
+    );
+    expect(compositePrompts[0].prompt).toContain(
+      'GENERATE 2 SEPARATE, INDIVIDUAL IMAGES'
+    );
+    expect(compositePrompts[0].prompt).toContain(
+      'IMAGE 1 OF 2 — Page 1 Layout & Panels'
+    );
+    expect(compositePrompts[0].prompt).toContain(
+      'IMAGE 2 OF 2 — Page 2 Layout & Panels'
+    );
     expect(compositePrompts[0].prompt).toContain('Ligne Claire Cyberpunk');
     expect(compositePrompts[0].prompt).toContain(
       'Aria Vance (silver bob, brass ocular loupe, ochre trenchcoat)'
@@ -930,6 +942,65 @@ Let me know if you want any adjustments!`;
     expect(resetState.scenes).toHaveLength(0);
     expect(resetState.storyBible.characters).toHaveLength(0);
     expect((await storage.load())?.title).toBe('Untitled Comic');
+  });
+
+  it('uploads multiple page images (filling unillustrated pages or appending new pages), clears page images, and reorders pages with automatic page renumbering', async () => {
+    const storage = createInMemoryStorageAdapter();
+    const engine = await createComicEngine({ storage });
+
+    const page1 = engine.addPage('Opening Skybridge');
+    const page2 = engine.addPage('Vane Confrontation');
+
+    // 1. Bulk upload 3 images in 'fill-empty' mode: fills page1 & page2 first, and appends a new Page 3 for the 3rd image
+    const pagesAfterFill = engine.uploadPageImages([
+      { dataUrl: 'data:image/png;base64,img1', name: '01-bridge.png' },
+      { dataUrl: 'data:image/png;base64,img2', name: '02-confrontation.png' },
+      { dataUrl: 'data:image/png;base64,img3', name: '03-climax.png' },
+    ]);
+
+    expect(pagesAfterFill).toHaveLength(3);
+    expect(pagesAfterFill.map((p) => p.pageNumber)).toEqual([1, 2, 3]);
+    expect(pagesAfterFill[0].id).toBe(page1.id);
+    expect(pagesAfterFill[0].summary).toBe('Opening Skybridge');
+    expect(pagesAfterFill[0].renderedImageDataUrl).toBe('data:image/png;base64,img1');
+    expect(pagesAfterFill[1].id).toBe(page2.id);
+    expect(pagesAfterFill[1].renderedImageDataUrl).toBe('data:image/png;base64,img2');
+    expect(pagesAfterFill[2].summary).toBe('03-climax');
+    expect(pagesAfterFill[2].renderedImageDataUrl).toBe('data:image/png;base64,img3');
+
+    const page3Id = pagesAfterFill[2].id;
+
+    // 2. Move Page 3 up to position 1 (index 0) or step-by-step and verify pageNumbers renumber 1..3
+    engine.movePage(page3Id, 'up');
+    expect(engine.getComic().pages.map((p) => ({ id: p.id, pageNumber: p.pageNumber }))).toEqual([
+      { id: page1.id, pageNumber: 1 },
+      { id: page3Id, pageNumber: 2 },
+      { id: page2.id, pageNumber: 3 },
+    ]);
+
+    // 3. Reorder pages directly via thumbnail drag-and-drop ID order
+    const reordered = engine.reorderPages([page3Id, page2.id, page1.id]);
+    expect(reordered.map((p) => ({ id: p.id, pageNumber: p.pageNumber }))).toEqual([
+      { id: page3Id, pageNumber: 1 },
+      { id: page2.id, pageNumber: 2 },
+      { id: page1.id, pageNumber: 3 },
+    ]);
+
+    // 4. Clear an image from a page without deleting the page itself
+    engine.clearPageImage(page2.id);
+    expect(engine.getComic().pages.find((p) => p.id === page2.id)?.renderedImageDataUrl).toBeUndefined();
+
+    // 5. Append mode always creates new pages at the end even when a page has no image
+    const afterAppend = engine.uploadPageImages(
+      [{ dataUrl: 'data:image/png;base64,img4', name: 'epilogue.webp' }],
+      { mode: 'append' }
+    );
+    expect(afterAppend).toHaveLength(4);
+    expect(afterAppend[3].pageNumber).toBe(4);
+    expect(afterAppend[3].summary).toBe('epilogue');
+    expect(afterAppend[3].renderedImageDataUrl).toBe('data:image/png;base64,img4');
+    // Page 2 is still empty because mode was 'append'
+    expect(afterAppend.find((p) => p.id === page2.id)?.renderedImageDataUrl).toBeUndefined();
   });
 });
 

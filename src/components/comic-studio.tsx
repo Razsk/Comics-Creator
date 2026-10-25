@@ -9,6 +9,7 @@ import {
   ImagePromptDeliveryMode,
   LetteringMode,
   Location,
+  PageImageUploadMode,
   PanelFraming,
   PanelHeightWeight,
   PanelTextElement,
@@ -24,6 +25,7 @@ import {
   extractClipboardImageAsDataUrl,
   readFileAsDataUrl,
   readFileAsText,
+  readFilesAsDataUrls,
 } from './file-utils';
 import { StagedDiffBanner } from './staged-diff-banner';
 import { StoryBibleTab, StoryBibleView } from './story-bible-view';
@@ -31,10 +33,19 @@ import { StoryBibleTab, StoryBibleView } from './story-bible-view';
 export interface ComicStudioProps {
   storage?: ComicStorageAdapter;
   onCopyToClipboard?: (text: string) => Promise<void> | void;
+  onPrint?: () => void;
 }
 
-type WorkspaceMode = 'initiation' | 'story-bible' | 'canvas';
+type WorkspaceMode = 'initiation' | 'story-bible' | 'canvas' | 'print';
 type RightDockTab = 'refine' | 'inspector' | 'search-replace' | 'image-prompts';
+type PrintImageFit = 'contain' | 'cover' | 'fill';
+type PrintPageBackground = 'white' | 'black';
+
+const PRINT_FIT_CLASS_MAP: Record<PrintImageFit, string> = {
+  contain: 'object-contain',
+  cover: 'object-cover',
+  fill: 'object-fill',
+};
 
 const HEIGHT_CLASS_MAP: Record<PanelHeightWeight, string> = {
   sm: 'min-h-[130px]',
@@ -48,7 +59,7 @@ const COL_SPAN_STYLE = (colSpan: number): React.CSSProperties => ({
   gridColumn: `span ${Math.min(12, Math.max(1, colSpan))} / span ${Math.min(12, Math.max(1, colSpan))}`,
 });
 
-export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
+export function ComicStudio({ storage, onCopyToClipboard, onPrint }: ComicStudioProps) {
   const [engine, setEngine] = useState<ComicEngine | null>(null);
   const [comic, setComic] = useState<Comic | null>(null);
   const [stagedDiff, setStagedDiff] = useState<StagedDiff | null>(null);
@@ -56,6 +67,13 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
   const [mode, setMode] = useState<WorkspaceMode>('canvas');
   const [bibleTab, setBibleTab] = useState<StoryBibleTab>('characters');
   const [rightTab, setRightTab] = useState<RightDockTab>('refine');
+
+  const [uploadMode, setUploadMode] = useState<PageImageUploadMode>('fill-empty');
+  const [printImageFit, setPrintImageFit] = useState<PrintImageFit>('contain');
+  const [printPageBackground, setPrintPageBackground] = useState<PrintPageBackground>('white');
+  const [showPrintPageNumbers, setShowPrintPageNumbers] = useState<boolean>(false);
+  const [draggedPageId, setDraggedPageId] = useState<string | null>(null);
+  const [dragOverPageId, setDragOverPageId] = useState<string | null>(null);
 
   const [activeCharacterId, setActiveCharacterId] = useState<string | null>(null);
   const [activeLocationId, setActiveLocationId] = useState<string | null>(null);
@@ -338,6 +356,42 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
     await copyText(prompt, 'Selection prompt');
   };
 
+  const handlePrintPages = () => {
+    if (onPrint) {
+      onPrint();
+    } else if (typeof window !== 'undefined' && typeof window.print === 'function') {
+      window.print();
+    }
+  };
+
+  const handleUploadPrintImages = (files: FileList | File[]) => {
+    readFilesAsDataUrls(files, (items) => {
+      if (items.length === 0) return;
+      engine.uploadPageImages(items, { mode: uploadMode });
+      setStatusToast(`Uploaded ${items.length} page image(s).`);
+    });
+  };
+
+  const handleDropPageThumbnail = (targetPageId: string) => {
+    if (!draggedPageId || draggedPageId === targetPageId) {
+      setDraggedPageId(null);
+      setDragOverPageId(null);
+      return;
+    }
+    const currentIds = comic.pages.map((p) => p.id);
+    const fromIdx = currentIds.indexOf(draggedPageId);
+    const toIdx = currentIds.indexOf(targetPageId);
+    if (fromIdx !== -1 && toIdx !== -1) {
+      const nextIds = [...currentIds];
+      const [moved] = nextIds.splice(fromIdx, 1);
+      nextIds.splice(toIdx, 0, moved);
+      engine.reorderPages(nextIds);
+      setStatusToast('Pages reordered.');
+    }
+    setDraggedPageId(null);
+    setDragOverPageId(null);
+  };
+
   const selectedScene =
     selection.scope === 'scenes'
       ? comic.scenes.find((s) => s.id === selection.selectedIds[0])
@@ -372,7 +426,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
 
   return (
     <div
-      className="flex h-screen flex-col bg-slate-950 text-slate-100"
+      className="studio-root flex h-screen flex-col bg-slate-950 text-slate-100"
       onPaste={(e) => {
         if (selectedPanel) {
           extractClipboardImageAsDataUrl(e.clipboardData, (dataUrl) => {
@@ -388,7 +442,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
       }}
     >
       {/* Top Studio Bar */}
-      <header className="flex items-center justify-between border-b border-slate-800 bg-slate-900/90 px-4 py-2.5">
+      <header className="no-print flex items-center justify-between border-b border-slate-800 bg-slate-900/90 px-4 py-2.5 print:hidden">
         <div className="flex items-center gap-3">
           <span className="rounded bg-amber-500/20 px-2.5 py-1 text-xs font-bold tracking-wider text-amber-300 uppercase">
             Comics Creator
@@ -450,18 +504,20 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
       </header>
 
       {stagedDiff && (
-        <StagedDiffBanner
-          comic={comic}
-          stagedDiff={stagedDiff}
-          onAccept={handleApplyStagedDiff}
-          onDiscard={handleDiscardStagedDiff}
-        />
+        <div className="no-print print:hidden">
+          <StagedDiffBanner
+            comic={comic}
+            stagedDiff={stagedDiff}
+            onAccept={handleApplyStagedDiff}
+            onDiscard={handleDiscardStagedDiff}
+          />
+        </div>
       )}
 
       {/* Main 3-Pane Workspace */}
-      <div className="grid flex-1 grid-cols-12 overflow-hidden">
+      <div className="studio-grid grid flex-1 grid-cols-12 overflow-hidden">
         {/* Left Sidebar: Navigation & Outline */}
-        <aside className="col-span-2 flex flex-col border-r border-slate-800 bg-slate-900/60 p-3 overflow-y-auto">
+        <aside className="no-print col-span-2 flex flex-col border-r border-slate-800 bg-slate-900/60 p-3 overflow-y-auto print:hidden">
           <div className="space-y-1">
             <button
               type="button"
@@ -496,6 +552,18 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               }`}
             >
               Comic Canvas ({comic.pages.length} Pages)
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('print')}
+              className={`w-full rounded px-3 py-2 text-left text-xs font-semibold ${
+                mode === 'print'
+                  ? 'bg-amber-500 text-slate-950'
+                  : 'text-slate-300 hover:bg-slate-800'
+              }`}
+            >
+              Print & PDF Pages ({comic.pages.filter((p) => !!p.renderedImageDataUrl).length}/
+              {comic.pages.length})
             </button>
           </div>
 
@@ -564,25 +632,54 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               </button>
             </div>
             <ul className="mt-2 space-y-1.5 text-xs">
-              {comic.pages.map((page) => {
+              {comic.pages.map((page, idx) => {
                 const isPageSelected =
                   selection.scope === 'pages' && selection.selectedIds.includes(page.id);
                 return (
-                  <li key={page.id} className="space-y-1">
+                  <li key={page.id} className="flex items-center gap-1">
                     <button
                       type="button"
                       onClick={(e) => {
                         setMode('canvas');
                         handleSelectElement('pages', page.id, undefined, e.shiftKey || e.ctrlKey);
                       }}
-                      className={`w-full rounded px-2 py-1 text-left font-medium ${
+                      className={`flex flex-1 items-center gap-2 rounded px-2 py-1 text-left font-medium ${
                         isPageSelected
                           ? 'bg-amber-500/20 text-amber-300 border border-amber-500/50'
                           : 'bg-slate-950/70 text-slate-200 hover:bg-slate-800'
                       }`}
                     >
-                      Page {page.pageNumber} ({page.panels.length} panels)
+                      {page.renderedImageDataUrl && (
+                        <img
+                          src={page.renderedImageDataUrl}
+                          alt={`Outline Page ${page.pageNumber}`}
+                          className="h-6 w-5 shrink-0 rounded border border-slate-700 object-cover bg-black"
+                        />
+                      )}
+                      <span className="truncate">
+                        Page {page.pageNumber} ({page.panels.length} panels)
+                      </span>
                     </button>
+                    <div className="flex flex-col gap-0.5">
+                      <button
+                        type="button"
+                        aria-label={`Move Outline Page ${page.pageNumber} Up`}
+                        disabled={idx === 0}
+                        onClick={() => engine.movePage(page.id, 'up')}
+                        className="rounded border border-slate-800 bg-slate-950 px-1 text-[9px] text-slate-400 hover:text-white disabled:opacity-25"
+                      >
+                        ↑
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Move Outline Page ${page.pageNumber} Down`}
+                        disabled={idx === comic.pages.length - 1}
+                        onClick={() => engine.movePage(page.id, 'down')}
+                        className="rounded border border-slate-800 bg-slate-950 px-1 text-[9px] text-slate-400 hover:text-white disabled:opacity-25"
+                      >
+                        ↓
+                      </button>
+                    </div>
                   </li>
                 );
               })}
@@ -591,7 +688,7 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
         </aside>
 
         {/* Center Workspace */}
-        <main className="col-span-6 overflow-y-auto p-6">
+        <main className="studio-main col-span-6 overflow-y-auto p-6 print:col-span-12 print:p-0">
           {mode === 'initiation' && (
             <div className="space-y-6">
               <div>
@@ -733,6 +830,13 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setMode('print')}
+                    className="rounded border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-700"
+                  >
+                    Printer-Friendly / Print PDF
+                  </button>
                   <button
                     type="button"
                     aria-label="Edit All Panels & Speech"
@@ -1419,10 +1523,339 @@ export function ComicStudio({ storage, onCopyToClipboard }: ComicStudioProps) {
               )}
             </div>
           )}
+
+          {mode === 'print' && (
+            <div className="space-y-6 print:space-y-0">
+              {/* Printer-Friendly Pages Controls & Multi-Image Upload Bar (Hidden in Print) */}
+              <div
+                className="no-print space-y-4 rounded-xl border border-slate-800 bg-slate-900/90 p-5 print:hidden"
+                onDragOver={(e) => {
+                  e.preventDefault();
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+                    handleUploadPrintImages(e.dataTransfer.files);
+                  }
+                }}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h1 className="text-base font-bold text-white">
+                      Printer-Friendly Pages &amp; PDF Studio
+                    </h1>
+                    <p className="text-xs text-slate-400">
+                      Upload comic page images, drag or click thumbnails to reorder pages, and print
+                      or save to PDF with each image resized to fit one full page.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="cursor-pointer rounded-lg border border-amber-500/50 bg-amber-500/15 px-3.5 py-2 text-xs font-bold text-amber-300 hover:bg-amber-500/25">
+                      + Upload Page Images
+                      <input
+                        aria-label="Upload Page Images"
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        className="hidden"
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files.length > 0) {
+                            handleUploadPrintImages(e.target.files);
+                            e.target.value = '';
+                          }
+                        }}
+                      />
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={handlePrintPages}
+                      disabled={comic.pages.length === 0}
+                      className="rounded-lg bg-amber-500 px-4 py-2 text-xs font-bold text-slate-950 hover:bg-amber-400 disabled:opacity-40"
+                    >
+                      Print / Save as PDF
+                    </button>
+                  </div>
+                </div>
+
+                {/* Upload & Print Layout Options */}
+                <div className="grid grid-cols-1 gap-3 border-t border-slate-800 pt-3 sm:grid-cols-4 text-xs">
+                  <div>
+                    <label
+                      htmlFor="print-upload-mode"
+                      className="block text-[11px] font-semibold text-slate-400"
+                    >
+                      Multi-Image Upload Mode
+                    </label>
+                    <select
+                      id="print-upload-mode"
+                      aria-label="Multi-Image Upload Mode"
+                      value={uploadMode}
+                      onChange={(e) => setUploadMode(e.target.value as PageImageUploadMode)}
+                      className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
+                    >
+                      <option value="fill-empty">Fill Unillustrated Pages First, Then Append</option>
+                      <option value="append">Append All as New Pages</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="print-image-fit"
+                      className="block text-[11px] font-semibold text-slate-400"
+                    >
+                      Page Image Fit
+                    </label>
+                    <select
+                      id="print-image-fit"
+                      aria-label="Page Image Fit"
+                      value={printImageFit}
+                      onChange={(e) => setPrintImageFit(e.target.value as PrintImageFit)}
+                      className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
+                    >
+                      <option value="contain">Fit Entire Image on 1 Page (Contain)</option>
+                      <option value="cover">Fill Full Page Bleed (Cover)</option>
+                      <option value="fill">Stretch to Page Bounds (Fill)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="print-page-bg"
+                      className="block text-[11px] font-semibold text-slate-400"
+                    >
+                      Page Sheet Background
+                    </label>
+                    <select
+                      id="print-page-bg"
+                      aria-label="Page Sheet Background"
+                      value={printPageBackground}
+                      onChange={(e) =>
+                        setPrintPageBackground(e.target.value as PrintPageBackground)
+                      }
+                      className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-white"
+                    >
+                      <option value="white">Printer-Friendly White</option>
+                      <option value="black">Dark / Black</option>
+                    </select>
+                  </div>
+
+                  <div className="flex items-end pb-1">
+                    <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        aria-label="Show Page Numbers on Print"
+                        checked={showPrintPageNumbers}
+                        onChange={(e) => setShowPrintPageNumbers(e.target.checked)}
+                        className="rounded border-slate-700 bg-slate-950 text-amber-500"
+                      />
+                      <span>Show Page Numbers on Sheets</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Page Thumbnails Reorder Strip */}
+                <div className="border-t border-slate-800 pt-4">
+                  <div className="mb-2.5 flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase tracking-wider text-amber-400">
+                      Page Thumbnails — Drag or Click Arrows to Reorder ({comic.pages.length} Pages)
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      Drag any thumbnail card onto another to reorder pages
+                    </span>
+                  </div>
+
+                  {comic.pages.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/60 p-8 text-center text-xs text-slate-400">
+                      No pages yet. Click <strong>+ Upload Page Images</strong> above or drop image
+                      files here to create printer-friendly comic pages.
+                    </div>
+                  ) : (
+                    <div
+                      aria-label="Page Thumbnails Reorder Strip"
+                      className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4"
+                    >
+                      {comic.pages.map((page, idx) => {
+                        const isDragging = draggedPageId === page.id;
+                        const isDragOver = dragOverPageId === page.id;
+                        return (
+                          <div
+                            key={page.id}
+                            data-testid={`print-thumbnail-page-${page.pageNumber}`}
+                            draggable
+                            onDragStart={(e) => {
+                              setDraggedPageId(page.id);
+                              e.dataTransfer?.setData('text/plain', page.id);
+                            }}
+                            onDragOver={(e) => {
+                              e.preventDefault();
+                              if (dragOverPageId !== page.id) {
+                                setDragOverPageId(page.id);
+                              }
+                            }}
+                            onDragLeave={() => {
+                              if (dragOverPageId === page.id) {
+                                setDragOverPageId(null);
+                              }
+                            }}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleDropPageThumbnail(page.id);
+                            }}
+                            onDragEnd={() => {
+                              setDraggedPageId(null);
+                              setDragOverPageId(null);
+                            }}
+                            className={`flex flex-col justify-between rounded-lg border-2 bg-slate-950 p-2.5 transition cursor-grab ${
+                              isDragOver
+                                ? 'border-amber-400 ring-2 ring-amber-400/30'
+                                : isDragging
+                                  ? 'border-amber-500/60 opacity-50'
+                                  : 'border-slate-800 hover:border-slate-600'
+                            }`}
+                          >
+                            <div>
+                              <div className="mb-1.5 flex items-center justify-between gap-1">
+                                <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[11px] font-bold text-amber-300">
+                                  Page {page.pageNumber}
+                                </span>
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    aria-label={`Move Page ${page.pageNumber} Earlier`}
+                                    title="Move Page Earlier"
+                                    disabled={idx === 0}
+                                    onClick={() => engine.movePage(page.id, 'up')}
+                                    className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-bold text-slate-200 hover:bg-slate-800 disabled:opacity-30"
+                                  >
+                                    ←
+                                  </button>
+                                  <button
+                                    type="button"
+                                    aria-label={`Move Page ${page.pageNumber} Later`}
+                                    title="Move Page Later"
+                                    disabled={idx === comic.pages.length - 1}
+                                    onClick={() => engine.movePage(page.id, 'down')}
+                                    className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] font-bold text-slate-200 hover:bg-slate-800 disabled:opacity-30"
+                                  >
+                                    →
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="flex aspect-[3/4] w-full items-center justify-center overflow-hidden rounded border border-slate-800 bg-slate-900">
+                                {page.renderedImageDataUrl ? (
+                                  <img
+                                    src={page.renderedImageDataUrl}
+                                    alt={`Thumbnail Page ${page.pageNumber}`}
+                                    className="h-full w-full object-contain"
+                                  />
+                                ) : (
+                                  <span className="px-2 text-center text-[11px] text-slate-500">
+                                    No image uploaded
+                                  </span>
+                                )}
+                              </div>
+
+                              {page.summary && (
+                                <p className="mt-1.5 truncate text-[11px] text-slate-300">
+                                  {page.summary}
+                                </p>
+                              )}
+                            </div>
+
+                            <div className="mt-2 flex flex-wrap items-center justify-between gap-1 border-t border-slate-800/80 pt-2">
+                              <label className="cursor-pointer rounded border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] text-amber-300 hover:bg-slate-800">
+                                {page.renderedImageDataUrl ? 'Replace' : 'Upload'}
+                                <input
+                                  aria-label={`Upload Image for Page ${page.pageNumber}`}
+                                  type="file"
+                                  accept="image/*"
+                                  className="hidden"
+                                  onChange={(e) => {
+                                    const file = e.target.files?.[0];
+                                    if (!file) return;
+                                    readFileAsDataUrl(file, (dataUrl) => {
+                                      engine.attachPageImage(page.id, dataUrl);
+                                    });
+                                    e.target.value = '';
+                                  }}
+                                />
+                              </label>
+
+                              {page.renderedImageDataUrl && (
+                                <button
+                                  type="button"
+                                  aria-label={`Clear Image for Page ${page.pageNumber}`}
+                                  onClick={() => engine.clearPageImage(page.id)}
+                                  className="rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[10px] text-slate-400 hover:text-white"
+                                >
+                                  Clear
+                                </button>
+                              )}
+
+                              <button
+                                type="button"
+                                aria-label={`Delete Print Page ${page.pageNumber}`}
+                                onClick={() => engine.deletePage(page.id)}
+                                className="rounded border border-rose-800/50 bg-rose-950/40 px-1.5 py-0.5 text-[10px] text-rose-300 hover:bg-rose-900/50"
+                              >
+                                ×
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Printer-Friendly One-Page-Per-Image Sheet Stack */}
+              <div className="space-y-8 print:space-y-0">
+                {comic.pages.map((page) => (
+                  <div
+                    key={page.id}
+                    data-testid={`print-sheet-page-${page.pageNumber}`}
+                    className={`print-sheet relative mx-auto flex aspect-[8.5/11] w-full max-w-[760px] flex-col items-center justify-center overflow-hidden rounded-lg border shadow-2xl ${
+                      printPageBackground === 'white'
+                        ? 'border-slate-300 bg-white text-slate-900'
+                        : 'border-slate-800 bg-black text-slate-100'
+                    }`}
+                  >
+                    {page.renderedImageDataUrl ? (
+                      <img
+                        src={page.renderedImageDataUrl}
+                        alt={`Print Page ${page.pageNumber}`}
+                        className={`h-full w-full max-h-full max-w-full ${PRINT_FIT_CLASS_MAP[printImageFit]}`}
+                      />
+                    ) : (
+                      <div className="no-print flex flex-col items-center justify-center gap-2 p-8 text-center print:hidden">
+                        <p className="text-sm font-semibold text-slate-500">
+                          Page {page.pageNumber} {page.summary ? `— ${page.summary}` : ''}
+                        </p>
+                        <p className="text-xs text-slate-400">
+                          No page image uploaded yet. Upload an image above to print this page.
+                        </p>
+                      </div>
+                    )}
+
+                    {showPrintPageNumbers && (
+                      <div className="pointer-events-none absolute bottom-2 right-3 rounded bg-black/50 px-2 py-0.5 text-[11px] font-semibold text-white">
+                        {page.pageNumber}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </main>
 
         {/* Right Dock: LLM Clipboard Bridge, Direct Inspector, Search & Replace, and Image Prompt Studio */}
-        <aside className="col-span-4 flex flex-col border-l border-slate-800 bg-slate-900/70 p-4 overflow-y-auto">
+        <aside className="no-print col-span-4 flex flex-col border-l border-slate-800 bg-slate-900/70 p-4 overflow-y-auto print:hidden">
           <div className="mb-4 flex flex-wrap gap-1 rounded-lg bg-slate-950 p-1">
             <button
               type="button"

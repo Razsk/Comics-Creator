@@ -150,6 +150,9 @@ describe('ComicStudio UI (Seam 2: 3-Pane Studio Integration)', () => {
       expect(clipboardSpy).toHaveBeenCalledTimes(3);
     });
     const copiedImagePrompt = clipboardSpy.mock.calls[2][0] as string;
+    expect(copiedImagePrompt).toContain(
+      'generate 2 separate, individual images — one standalone image for each requested Page'
+    );
     expect(copiedImagePrompt).toContain('Aria Vance (silver bob, brass loupe, ochre coat)');
     expect(copiedImagePrompt).toContain('Wide shot of Aria stepping onto the rain-swept bridge.');
   });
@@ -261,5 +264,76 @@ describe('ComicStudio UI (Seam 2: 3-Pane Studio Integration)', () => {
     saved = await storage.load();
     expect(saved?.title).toBe('Untitled Comic');
     expect(saved?.pages).toHaveLength(0);
+  });
+
+  it('uploads multiple images for printer-friendly pages, resizes each image to fit one page, reorders pages via thumbnails, and triggers Print / Save as PDF', async () => {
+    const storage = createInMemoryStorageAdapter();
+    const printSpy = vi.fn();
+
+    render(<ComicStudio storage={storage} onPrint={printSpy} />);
+    await screen.findByDisplayValue('Untitled Comic');
+
+    // 1. Switch to Printer-Friendly Pages view
+    fireEvent.click(screen.getByRole('button', { name: /Print & PDF Pages/i }));
+
+    // 2. Upload 3 page images at once
+    const fileInput = screen.getByLabelText(/Upload Page Images/i);
+    const file1 = new File(['img-bytes-1'], '01-cover.png', { type: 'image/png' });
+    const file2 = new File(['img-bytes-2'], '02-skybridge.png', { type: 'image/png' });
+    const file3 = new File(['img-bytes-3'], '03-finale.png', { type: 'image/png' });
+
+    fireEvent.change(fileInput, { target: { files: [file1, file2, file3] } });
+
+    // Wait for thumbnails and printer-friendly page sheets to render
+    await screen.findByAltText('Thumbnail Page 1');
+    expect(screen.getByAltText('Thumbnail Page 2')).toBeInTheDocument();
+    expect(screen.getByAltText('Thumbnail Page 3')).toBeInTheDocument();
+
+    // Verify each image is rendered inside a printer-friendly single-page sheet resized to fit one page
+    const printPage1Img = screen.getByAltText('Print Page 1');
+    const printPage2Img = screen.getByAltText('Print Page 2');
+    const printPage3Img = screen.getByAltText('Print Page 3');
+    expect(printPage1Img).toHaveClass('object-contain');
+    expect(printPage2Img).toHaveClass('object-contain');
+    expect(printPage3Img).toHaveClass('object-contain');
+
+    let saved = await storage.load();
+    expect(saved?.pages.map((p) => p.summary)).toEqual([
+      '01-cover',
+      '02-skybridge',
+      '03-finale',
+    ]);
+
+    // 3. Reorder pages using thumbnail controls: move Page 3 earlier to Page 2
+    fireEvent.click(screen.getByRole('button', { name: /Move Page 3 Earlier/i }));
+
+    await waitFor(async () => {
+      saved = await storage.load();
+      expect(saved?.pages.map((p) => p.summary)).toEqual([
+        '01-cover',
+        '03-finale',
+        '02-skybridge',
+      ]);
+    });
+
+    // 4. Reorder pages via drag-and-drop on thumbnails: drag Page 2 ('03-finale') onto Page 1 ('01-cover')
+    const thumb2 = screen.getByTestId('print-thumbnail-page-2');
+    const thumb1 = screen.getByTestId('print-thumbnail-page-1');
+    fireEvent.dragStart(thumb2);
+    fireEvent.dragOver(thumb1);
+    fireEvent.drop(thumb1);
+
+    await waitFor(async () => {
+      saved = await storage.load();
+      expect(saved?.pages.map((p) => p.summary)).toEqual([
+        '03-finale',
+        '01-cover',
+        '02-skybridge',
+      ]);
+    });
+
+    // 5. Trigger Print / Save as PDF
+    fireEvent.click(screen.getByRole('button', { name: /Print \/ Save as PDF/i }));
+    expect(printSpy).toHaveBeenCalledTimes(1);
   });
 });

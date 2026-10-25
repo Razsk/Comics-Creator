@@ -8,6 +8,7 @@ import {
   LetteringMode,
   Location,
   Page,
+  PageImageUploadMode,
   Panel,
   PanelTextElement,
   Prop,
@@ -22,6 +23,7 @@ import {
   SelectionTarget,
   StagedDiff,
   TargetedPatchScope,
+  UploadedPageImageInput,
   VisualStyle,
 } from './types';
 
@@ -350,21 +352,34 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
     const lines: string[] = [
       '# COMIC ILLUSTRATION GENERATION PROMPT',
       targetPages.length > 1
-        ? `Render a multi-page comic sequence covering Pages ${targetPages.map((p) => p.pageNumber).join(', ')}.`
+        ? `Render a multi-page comic sequence covering Pages ${targetPages.map((p) => p.pageNumber).join(', ')}. IMPORTANT: You MUST generate ${targetPages.length} separate, individual images — one standalone image for each requested Page.`
         : `Render Comic Page ${targetPages[0]?.pageNumber ?? 1}.`,
+    ];
+
+    if (targetPages.length > 1) {
+      lines.push(
+        '',
+        '## Multi-Page Output Instructions (CRITICAL — READ CAREFULLY)',
+        `- GENERATE ${targetPages.length} SEPARATE, INDIVIDUAL IMAGES: You MUST create ${targetPages.length} distinct images in total — one individual image for each requested Page (${targetPages.map((p, idx) => `Image ${idx + 1} = Page ${p.pageNumber}`).join('; ')}).`,
+        '- ONE PAGE PER IMAGE: Each generated image must depict ONLY a single Comic Page containing only that page\'s Tiers and Panels.',
+        '- DO NOT COMBINE PAGES INTO ONE IMAGE: Do NOT merge, stitch, or composite multiple pages together into a single image canvas, collage, or two-page spread image.'
+      );
+    }
+
+    lines.push(
       '',
       '## Global Visual Style',
       `- Art Tradition: ${vs.artTradition || 'Modern Comic Art'}`,
       `- Line & Inking: ${vs.lineAndInking || 'Crisp ink lines'}`,
       `- Color Palette & Shading: ${vs.colorPaletteAndShading || 'Balanced comic coloring'}`,
       `- Era & Tone: ${vs.eraAndTone || 'Cinematic'}`,
-      vs.negativePrompt ? `- Avoid / Negative Prompt: ${vs.negativePrompt}` : '',
+      ...(vs.negativePrompt ? [`- Avoid / Negative Prompt: ${vs.negativePrompt}`] : []),
       '',
       '## Lettering Mode',
       letteringMode === 'baked-in'
         ? '- BAKED-IN LETTERING: Render crisp comic Dialogue balloons, narrative Captions, and stylized SFX lettering inside each Panel exactly as specified.'
-        : '- CLEAN ART ONLY: Render pure comic artwork and Panel borders ONLY. Include NO speech bubbles, captions, or text inside the Panels.',
-    ].filter(Boolean);
+        : '- CLEAN ART ONLY: Render pure comic artwork and Panel borders ONLY. Include NO speech bubbles, captions, or text inside the Panels.'
+    );
 
     if (bespokeInstruction) {
       lines.push('', '## Bespoke Art Direction', bespokeInstruction);
@@ -387,8 +402,18 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
       }
     }
 
-    for (const page of targetPages) {
-      lines.push('', `## Page ${page.pageNumber} Layout & Panels (${page.summary || 'Comic Page'})`);
+    for (const [pageIdx, page] of targetPages.entries()) {
+      lines.push(
+        '',
+        targetPages.length > 1
+          ? `## IMAGE ${pageIdx + 1} OF ${targetPages.length} — Page ${page.pageNumber} Layout & Panels (${page.summary || 'Comic Page'})`
+          : `## Page ${page.pageNumber} Layout & Panels (${page.summary || 'Comic Page'})`
+      );
+      if (targetPages.length > 1) {
+        lines.push(
+          `> Output Requirement: Create a separate, standalone image for Page ${page.pageNumber} (Individual Image ${pageIdx + 1} of ${targetPages.length}). Do not merge this page with any other page.`
+        );
+      }
       const tiers = groupPanelsByTier(page.panels, panelFilterIds);
       const sortedRowNumbers = Array.from(tiers.keys()).sort((a, b) => a - b);
       for (const rowNum of sortedRowNumbers) {
@@ -537,6 +562,103 @@ export async function createComicEngine(options: ComicEngineOptions = {}) {
       comic.pages = comic.pages
         .filter((p) => p.id !== pageId)
         .map((p, idx) => ({ ...p, pageNumber: idx + 1 }));
+      persist();
+    },
+
+    movePage(pageId: string, target: 'up' | 'down' | number): Page[] {
+      const fromIdx = comic.pages.findIndex((p) => p.id === pageId);
+      if (fromIdx === -1) return this.getComic().pages;
+
+      let toIdx = fromIdx;
+      if (target === 'up') {
+        toIdx = Math.max(0, fromIdx - 1);
+      } else if (target === 'down') {
+        toIdx = Math.min(comic.pages.length - 1, fromIdx + 1);
+      } else if (typeof target === 'number') {
+        toIdx = Math.max(0, Math.min(comic.pages.length - 1, Math.round(target)));
+      }
+
+      if (toIdx !== fromIdx) {
+        const [moved] = comic.pages.splice(fromIdx, 1);
+        comic.pages.splice(toIdx, 0, moved);
+        comic.pages.forEach((p, idx) => {
+          p.pageNumber = idx + 1;
+        });
+        persist();
+      }
+
+      return this.getComic().pages;
+    },
+
+    reorderPages(orderedPageIds: string[]): Page[] {
+      const pageMap = new Map(comic.pages.map((p) => [p.id, p]));
+      const seen = new Set<string>();
+      const reordered: Page[] = [];
+
+      for (const id of orderedPageIds) {
+        const page = pageMap.get(id);
+        if (page && !seen.has(id)) {
+          reordered.push(page);
+          seen.add(id);
+        }
+      }
+
+      for (const page of comic.pages) {
+        if (!seen.has(page.id)) {
+          reordered.push(page);
+          seen.add(page.id);
+        }
+      }
+
+      reordered.forEach((p, idx) => {
+        p.pageNumber = idx + 1;
+      });
+      comic.pages = reordered;
+      persist();
+      return this.getComic().pages;
+    },
+
+    uploadPageImages(
+      images: UploadedPageImageInput[],
+      uploadOptions: { mode?: PageImageUploadMode } = {}
+    ): Page[] {
+      const mode: PageImageUploadMode = uploadOptions.mode ?? 'fill-empty';
+
+      for (const img of images) {
+        if (!img.dataUrl) continue;
+        const cleanName = img.name ? img.name.replace(/\.[^.]+$/, '').trim() : '';
+
+        if (mode === 'fill-empty') {
+          const emptyPage = comic.pages.find((p) => !p.renderedImageDataUrl);
+          if (emptyPage) {
+            emptyPage.renderedImageDataUrl = img.dataUrl;
+            if (!emptyPage.summary && cleanName) {
+              emptyPage.summary = cleanName;
+            }
+            continue;
+          }
+        }
+
+        comic.pages.push({
+          id: createId('page'),
+          pageNumber: comic.pages.length + 1,
+          summary: cleanName,
+          panels: [],
+          renderedImageDataUrl: img.dataUrl,
+        });
+      }
+
+      comic.pages.forEach((p, idx) => {
+        p.pageNumber = idx + 1;
+      });
+      persist();
+      return this.getComic().pages;
+    },
+
+    clearPageImage(pageId: string): void {
+      const page = comic.pages.find((p) => p.id === pageId);
+      if (!page) return;
+      page.renderedImageDataUrl = undefined;
       persist();
     },
 
